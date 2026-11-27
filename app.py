@@ -117,9 +117,16 @@ def init_bot_tables() -> None:
                     last_name VARCHAR(160) DEFAULT '',
                     linked_gdz_uid INT DEFAULT 0,
                     linked_gdz_login VARCHAR(120) DEFAULT '',
-                    first_seen_ms BIGINT NOT NULL,
-                    last_seen_ms BIGINT NOT NULL
+                    first_seen_ms BIGINT NOT NULL DEFAULT 0,
+                    last_seen_ms BIGINT NOT NULL DEFAULT 0
                 );
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS tg_username VARCHAR(120) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS first_name VARCHAR(160) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS last_name VARCHAR(160) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS linked_gdz_uid INT DEFAULT 0;
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS linked_gdz_login VARCHAR(120) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS first_seen_ms BIGINT NOT NULL DEFAULT 0;
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS last_seen_ms BIGINT NOT NULL DEFAULT 0;
                 CREATE INDEX IF NOT EXISTS idx_bot_users_seen
                     ON banka_bot_users (last_seen_ms DESC);
 
@@ -129,8 +136,10 @@ def init_bot_tables() -> None:
                     chat_id BIGINT NOT NULL,
                     message_id BIGINT NOT NULL,
                     cleaned_flag BOOLEAN DEFAULT FALSE,
-                    created_ms BIGINT NOT NULL
+                    created_ms BIGINT NOT NULL DEFAULT 0
                 );
+                ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS cleaned_flag BOOLEAN DEFAULT FALSE;
+                ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS created_ms BIGINT NOT NULL DEFAULT 0;
                 CREATE INDEX IF NOT EXISTS idx_stars_inv_clean
                     ON banka_stars_invoices (cleaned_flag, order_uid);
 
@@ -142,9 +151,14 @@ def init_bot_tables() -> None:
                     pwd_hash VARCHAR(256) NOT NULL,
                     role VARCHAR(24) NOT NULL DEFAULT 'USER',
                     perms_json TEXT NOT NULL DEFAULT '{}',
-                    created_ms BIGINT NOT NULL,
+                    created_ms BIGINT NOT NULL DEFAULT 0,
                     last_login_ms BIGINT DEFAULT 0
                 );
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS display_name VARCHAR(120) DEFAULT '';
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS role VARCHAR(24) NOT NULL DEFAULT 'USER';
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS perms_json TEXT NOT NULL DEFAULT '{}';
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS created_ms BIGINT NOT NULL DEFAULT 0;
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS last_login_ms BIGINT DEFAULT 0;
 
                 CREATE TABLE IF NOT EXISTS banka_bot_web_sessions (
                     token_hash VARCHAR(128) PRIMARY KEY,
@@ -152,6 +166,7 @@ def init_bot_tables() -> None:
                     created_ms BIGINT NOT NULL,
                     expires_ms BIGINT NOT NULL
                 );
+                ALTER TABLE banka_bot_web_sessions ADD COLUMN IF NOT EXISTS expires_ms BIGINT NOT NULL DEFAULT 0;
                 CREATE INDEX IF NOT EXISTS idx_web_sess_exp
                     ON banka_bot_web_sessions (expires_ms);
 
@@ -164,11 +179,10 @@ def init_bot_tables() -> None:
                     message_text TEXT NOT NULL,
                     sent_count INT DEFAULT 0,
                     failed_count INT DEFAULT 0,
-                    created_ms BIGINT NOT NULL
+                    created_ms BIGINT NOT NULL DEFAULT 0
                 );
                 """
             )
-
 
 def upsert_bot_user(
     tg_user: types.User | None,
@@ -367,9 +381,9 @@ def delete_uncleaned_invoices_for_order(order_uid: int) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT invoice_uid, chat_id, message_id
+                    SELECT chat_id, message_id
                     FROM banka_stars_invoices
-                    WHERE order_uid = %s AND cleaned_flag = FALSE;
+                    WHERE order_uid = %s AND COALESCE(cleaned_flag, FALSE) = FALSE;
                     """,
                     (order_uid,),
                 )
@@ -386,7 +400,6 @@ def delete_uncleaned_invoices_for_order(order_uid: int) -> None:
                     )
     except Exception:
         pass
-
 
 def send_stars_invoice_for_order(chat_id: int, order: dict[str, Any]) -> None:
     order_uid = int(order["order_uid"])
@@ -1229,10 +1242,10 @@ def cancelled_invoice_watcher() -> None:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT i.invoice_uid, i.chat_id, i.message_id, o.status_tag
+                        SELECT i.order_uid, i.chat_id, i.message_id, o.status_tag
                         FROM banka_stars_invoices i
                         JOIN banka_stars_orders o ON o.order_uid = i.order_uid
-                        WHERE i.cleaned_flag = FALSE AND o.status_tag <> 'PENDING'
+                        WHERE COALESCE(i.cleaned_flag, FALSE) = FALSE AND o.status_tag <> 'PENDING'
                         LIMIT 30;
                         """
                     )
@@ -1243,8 +1256,12 @@ def cancelled_invoice_watcher() -> None:
                         except Exception:
                             pass
                         cur.execute(
-                            "UPDATE banka_stars_invoices SET cleaned_flag = TRUE WHERE invoice_uid = %s;",
-                            (r["invoice_uid"],),
+                            """
+                            UPDATE banka_stars_invoices
+                            SET cleaned_flag = TRUE
+                            WHERE order_uid = %s AND chat_id = %s AND message_id = %s;
+                            """,
+                            (r["order_uid"], r["chat_id"], r["message_id"]),
                         )
         except Exception:
             pass
