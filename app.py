@@ -1,532 +1,484 @@
-import base64
+from __future__ import annotations
+
 import hashlib
 import hmac
-import io
+import html
 import json
+import math
 import os
 import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
-
-try:
-    from zoneinfo import ZoneInfo
-    MSK_TZ = ZoneInfo("Europe/Moscow")
-except Exception:
-    MSK_TZ = timezone(timedelta(hours=3))
+from typing import Any
+from urllib.parse import urlparse
 
 import psycopg
+from psycopg.rows import dict_row
 import telebot
 from telebot import types
 
-# ============================================================
-# КОНФИГУРАЦИЯ (Переменные окружения Render)
-# ============================================================
+# -----------------------------
+# Конфигурация из Environment
+# -----------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-RAW_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-PORT = int(os.environ.get("PORT", "10000"))
-
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
-if not RAW_DATABASE_URL:
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
     raise RuntimeError("Не задана переменная окружения DATABASE_URL")
 
+PORT = int(os.environ.get("PORT", "10000"))
+MSK_TZ = timezone(timedelta(hours=3))
 
-def normalize_db_url(url: str) -> str:
-    u = url.strip()
-    if u.startswith("postgres://"):
-        u = "postgresql://" + u[len("postgres://"):]
-    parsed = urlparse(u)
-    host = (parsed.hostname or "").lower()
-    if host not in ("localhost", "127.0.0.1", "::1") and "sslmode=" not in (parsed.query or "").lower():
-        sep = "&" if parsed.query else "?"
-        u = f"{u}{sep}sslmode=require"
-    return u
+ROLE_SUPER_ADMIN = "SUPER_ADMIN"
+ROLE_MODERATOR = "MODERATOR"
+ROLE_USER = "USER"
 
+ALL_PERMISSIONS: dict[str, str] = {
+    "view_stats": "Просмотр доходов и статистики",
+    "view_users": "Просмотр пользователей бота и истории ⭐",
+    "view_orders": "Просмотр списка всех заказов Stars",
+    "send_dm": "Отправка личных сообщений в бота",
+    "send_broadcast": "Массовая рассылка всем пользователям бота",
+    "manage_orders": "Отмена активных (PENDING) заказов",
+}
 
-DATABASE_URL = normalize_db_url(RAW_DATABASE_URL)
-
-telebot.apihelper.CONNECT_TIMEOUT = 10
-telebot.apihelper.READ_TIMEOUT = 30
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, threaded=True)
-
-ALL_PERMISSIONS = [
-    ("view_dashboard", "Статистика и доходы"),
-    ("view_users", "Список пользователей и покупки Stars"),
-    ("view_chats", "Просмотр переписок (чатов) GDZgo"),
-    ("send_dm", "Личные сообщения пользователям в боте"),
-    ("broadcast", "Массовая рассылка (текст и фото)"),
-]
-PERM_KEYS = {k for k, _ in ALL_PERMISSIONS}
-
-REFERRAL_PREMIUM_BONUS_COINS = 30
-MAX_JSON_BODY_BYTES = 8_000_000
-MAX_PHOTO_RAW_BYTES = 5_500_000
-
-_db_init_lock = threading.Lock()
-_db_initialized = False
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+user_states: dict[int, dict[str, Any]] = {}
+state_lock = threading.Lock()
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def fmt_msk(ts_val) -> str:
-    if ts_val is None or ts_val == "":
+def fmt_msk(epoch_ms: int | None) -> str:
+    if not epoch_ms:
         return "—"
-    try:
-        if isinstance(ts_val, (int, float)):
-            sec = ts_val / 1000.0 if ts_val > 10_000_000_000 else float(ts_val)
-            dt = datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(MSK_TZ)
-            return dt.strftime("%d.%m.%Y %H:%M")
-        if isinstance(ts_val, datetime):
-            dt = ts_val if ts_val.tzinfo else ts_val.replace(tzinfo=timezone.utc)
-            return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M")
-        s = str(ts_val).strip()
-        if s.isdigit():
-            return fmt_msk(int(s))
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if not dt.tzinfo:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return str(ts_val)[:19]
+    dt = datetime.fromtimestamp(epoch_ms / 1000.0, tz=MSK_TZ)
+    return dt.strftime("%d.%m.%Y %H:%M:%S МСК")
 
 
-def get_conn():
+def db_connect() -> psycopg.Connection:
     return psycopg.connect(
         DATABASE_URL,
-        autocommit=False,
-        connect_timeout=10,
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
+        connect_timeout=12,
+        row_factory=dict_row,
     )
 
 
-def with_db(fn, retries: int = 2):
-    ensure_db_ready()
-    last_err = None
-    for attempt in range(retries):
+def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=16384,
+        r=8,
+        p=1,
+        maxmem=32 * 1024 * 1024,
+    )
+    return salt.hex(), digest.hex()
+
+
+def verify_password(password: str, salt_hex: str, expected_hash_hex: str) -> bool:
+    _, calc = hash_password(password, salt_hex)
+    return hmac.compare_digest(calc, expected_hash_hex)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def safe_json_dict(raw: Any) -> dict[str, bool]:
+    if isinstance(raw, dict):
+        return {k: bool(v) for k, v in raw.items() if k in ALL_PERMISSIONS}
+    if isinstance(raw, str) and raw.strip():
         try:
-            with get_conn() as conn:
-                res = fn(conn)
-                return res
-        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
-            last_err = exc
-            if attempt + 1 < retries:
-                time.sleep(0.25)
-                continue
-            raise
-    if last_err:
-        raise last_err
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {k: bool(v) for k, v in parsed.items() if k in ALL_PERMISSIONS}
+        except Exception:
+            pass
+    return {}
 
 
-def _table_exists(cur, table_name: str) -> bool:
-    cur.execute("SELECT to_regclass(%s) IS NOT NULL;", (table_name,))
-    row = cur.fetchone()
-    return bool(row and row[0])
-
-
-def init_bot_tables():
-    with get_conn() as conn:
+def init_bot_tables() -> None:
+    with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_bot_users (
                     tg_user_id BIGINT PRIMARY KEY,
                     tg_username VARCHAR(120) DEFAULT '',
-                    tg_first_name VARCHAR(160) DEFAULT '',
-                    tg_last_name VARCHAR(160) DEFAULT '',
-                    gdz_user_id INT DEFAULT 0,
-                    gdz_login VARCHAR(120) DEFAULT '',
-                    is_blocked BOOLEAN DEFAULT FALSE,
-                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    first_name VARCHAR(160) DEFAULT '',
+                    last_name VARCHAR(160) DEFAULT '',
+                    linked_gdz_uid INT DEFAULT 0,
+                    linked_gdz_login VARCHAR(120) DEFAULT '',
+                    first_seen_ms BIGINT NOT NULL DEFAULT 0,
+                    last_seen_ms BIGINT NOT NULL DEFAULT 0
                 );
-                """
-            )
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS tg_username VARCHAR(120) DEFAULT '';")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS tg_first_name VARCHAR(160) DEFAULT '';")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS tg_last_name VARCHAR(160) DEFAULT '';")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS gdz_user_id INT DEFAULT 0;")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS gdz_login VARCHAR(120) DEFAULT '';")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE;")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
-            cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS tg_username VARCHAR(120) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS first_name VARCHAR(160) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS last_name VARCHAR(160) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS linked_gdz_uid INT DEFAULT 0;
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS linked_gdz_login VARCHAR(120) DEFAULT '';
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS first_seen_ms BIGINT NOT NULL DEFAULT 0;
+                ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS last_seen_ms BIGINT NOT NULL DEFAULT 0;
+                CREATE INDEX IF NOT EXISTS idx_bot_users_seen
+                    ON banka_bot_users (last_seen_ms DESC);
 
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS banka_stars_orders (
-                    order_uid SERIAL PRIMARY KEY,
-                    pay_code VARCHAR(16) UNIQUE NOT NULL,
-                    buyer_uid INT NOT NULL DEFAULT 0,
-                    buyer_login VARCHAR(120) DEFAULT '',
-                    item_kind VARCHAR(32) NOT NULL,
-                    plan_days INT DEFAULT 0,
-                    coins_amount INT DEFAULT 0,
-                    target_bg_id INT DEFAULT 0,
-                    stars_amount INT NOT NULL,
-                    status_tag VARCHAR(24) NOT NULL DEFAULT 'PENDING',
-                    telegram_user_id BIGINT DEFAULT 0,
-                    telegram_charge_id VARCHAR(160) UNIQUE NULL,
-                    ui_celebrated BOOLEAN DEFAULT FALSE,
-                    created_ms BIGINT NOT NULL DEFAULT 0,
-                    paid_ms BIGINT DEFAULT NULL,
-                    created_stamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS banka_stars_invoices (
                     invoice_uid SERIAL PRIMARY KEY,
                     order_uid INT NOT NULL,
-                    pay_code VARCHAR(16) DEFAULT '',
                     chat_id BIGINT NOT NULL,
                     message_id BIGINT NOT NULL,
                     cleaned_flag BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (order_uid, chat_id, message_id)
+                    created_ms BIGINT NOT NULL DEFAULT 0
                 );
-                """
-            )
-            cur.execute("ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS order_uid INT NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS pay_code VARCHAR(16) DEFAULT '';")
-            cur.execute("ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS message_id BIGINT NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS cleaned_flag BOOLEAN DEFAULT FALSE;")
-            cur.execute("ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_banka_stars_invoices_clean
-                ON banka_stars_invoices (cleaned_flag, order_uid);
-                """
-            )
+                ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS cleaned_flag BOOLEAN DEFAULT FALSE;
+                ALTER TABLE banka_stars_invoices ADD COLUMN IF NOT EXISTS created_ms BIGINT NOT NULL DEFAULT 0;
+                CREATE INDEX IF NOT EXISTS idx_stars_inv_clean
+                    ON banka_stars_invoices (cleaned_flag, order_uid);
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS banka_bot_web_admins (
-                    admin_uid SERIAL PRIMARY KEY,
-                    username VARCHAR(80) UNIQUE NOT NULL,
-                    password_hash VARCHAR(255) NOT NULL,
+                    web_uid SERIAL PRIMARY KEY,
+                    login VARCHAR(80) UNIQUE NOT NULL,
+                    display_name VARCHAR(120) DEFAULT '',
+                    pwd_salt VARCHAR(64) NOT NULL,
+                    pwd_hash VARCHAR(256) NOT NULL,
                     role VARCHAR(24) NOT NULL DEFAULT 'USER',
-                    permissions_json TEXT NOT NULL DEFAULT '[]',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_login_at TIMESTAMP NULL
+                    perms_json TEXT NOT NULL DEFAULT '{}',
+                    created_ms BIGINT NOT NULL DEFAULT 0,
+                    last_login_ms BIGINT DEFAULT 0
                 );
-                """
-            )
-            cur.execute("ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS role VARCHAR(24) NOT NULL DEFAULT 'USER';")
-            cur.execute("ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS permissions_json TEXT NOT NULL DEFAULT '[]';")
-            cur.execute("ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP NULL;")
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS display_name VARCHAR(120) DEFAULT '';
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS role VARCHAR(24) NOT NULL DEFAULT 'USER';
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS perms_json TEXT NOT NULL DEFAULT '{}';
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS created_ms BIGINT NOT NULL DEFAULT 0;
+                ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS last_login_ms BIGINT DEFAULT 0;
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS banka_bot_web_sessions (
-                    token VARCHAR(96) PRIMARY KEY,
-                    admin_uid INT NOT NULL,
-                    expires_at TIMESTAMP NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    token_hash VARCHAR(128) PRIMARY KEY,
+                    web_uid INT NOT NULL REFERENCES banka_bot_web_admins(web_uid) ON DELETE CASCADE,
+                    created_ms BIGINT NOT NULL,
+                    expires_ms BIGINT NOT NULL
                 );
-                """
-            )
-            cur.execute("ALTER TABLE banka_bot_web_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '7 days');")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_banka_bot_web_sessions_exp ON banka_bot_web_sessions (expires_at);")
+                ALTER TABLE banka_bot_web_sessions ADD COLUMN IF NOT EXISTS expires_ms BIGINT NOT NULL DEFAULT 0;
+                CREATE INDEX IF NOT EXISTS idx_web_sess_exp
+                    ON banka_bot_web_sessions (expires_ms);
 
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS banka_bot_messages_log (
                     log_uid SERIAL PRIMARY KEY,
-                    sender_admin VARCHAR(80) NOT NULL,
-                    target_type VARCHAR(24) NOT NULL,
-                    target_tg_id BIGINT DEFAULT 0,
-                    message_text TEXT NOT NULL DEFAULT '',
-                    has_photo BOOLEAN DEFAULT FALSE,
+                    sender_web_uid INT NOT NULL,
+                    sender_login VARCHAR(80) NOT NULL,
+                    kind VARCHAR(24) NOT NULL,
+                    target_tg_user_id BIGINT DEFAULT 0,
+                    message_text TEXT NOT NULL,
                     sent_count INT DEFAULT 0,
                     failed_count INT DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_ms BIGINT NOT NULL DEFAULT 0
                 );
                 """
             )
-            cur.execute("ALTER TABLE banka_bot_messages_log ADD COLUMN IF NOT EXISTS has_photo BOOLEAN DEFAULT FALSE;")
-        conn.commit()
 
 
-def ensure_db_ready():
-    global _db_initialized
-    if _db_initialized:
+def upsert_bot_user(
+    tg_user: types.User | None,
+    linked_uid: int | None = None,
+    linked_login: str | None = None,
+) -> None:
+    if tg_user is None:
         return
-    with _db_init_lock:
-        if _db_initialized:
-            return
-        init_bot_tables()
-        _db_initialized = True
-
-
-def init_db_background():
-    while not _db_initialized:
-        try:
-            ensure_db_ready()
-            print("Database initialized successfully", flush=True)
-            return
-        except Exception as e:
-            print(f"[DB INIT RETRY] {e}", flush=True)
-            time.sleep(3)
-
-
-# ============================================================
-# БЕЗОПАСНОСТЬ ВЕБ-АДМИНКИ (scrypt + pbkdf2_sha256 из Android)
-# ============================================================
-def hash_password(password: str) -> str:
-    salt = secrets.token_bytes(16)
-    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
-    return f"scrypt${salt.hex()}${dk.hex()}"
-
-
-def verify_password(password: str, stored: str) -> bool:
+    ts = now_ms()
+    uname = (tg_user.username or "").strip().lstrip("@")[:120]
+    fname = (tg_user.first_name or "").strip()[:160]
+    lname = (tg_user.last_name or "").strip()[:160]
+    l_uid = int(linked_uid) if linked_uid and linked_uid > 0 else 0
+    l_login = (linked_login or "").strip()[:120]
     try:
-        parts = stored.split("$")
-        if len(parts) != 3:
-            return False
-        algo, salt_hex, dk_hex = parts
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(dk_hex)
-        if algo == "scrypt":
-            dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
-            return hmac.compare_digest(dk, expected)
-        if algo == "pbkdf2_sha256":
-            dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000, dklen=32)
-            return hmac.compare_digest(dk, expected)
-        return False
-    except Exception:
-        return False
-
-
-def parse_perms(raw_json: str) -> list[str]:
-    try:
-        arr = json.loads(raw_json or "[]")
-        if isinstance(arr, list):
-            return [str(x) for x in arr if str(x) in PERM_KEYS]
-    except Exception:
-        pass
-    return []
-
-
-def user_has_perm(admin_row: dict, perm: str) -> bool:
-    if not admin_row:
-        return False
-    role = (admin_row.get("role") or "USER").upper()
-    if role == "SUPER_ADMIN":
-        return True
-    if role == "MODERATOR":
-        return perm in (admin_row.get("permissions") or [])
-    return False
-
-
-# ============================================================
-# ДЕКОДИРОВАНИЕ И ПРОВЕРКА ФОТО ДЛЯ РАССЫЛКИ / ЛС
-# ============================================================
-def parse_image_data_url(raw_data: str):
-    if not raw_data:
-        return None, ""
-    s = str(raw_data).strip()
-    ext = "jpg"
-    if s.startswith("data:"):
-        if ";base64," not in s:
-            raise ValueError("Некорректный формат изображения")
-        header, b64_part = s.split(";base64,", 1)
-        mime = header[5:].lower()
-        if mime == "image/png":
-            ext = "png"
-        elif mime == "image/webp":
-            ext = "webp"
-        elif mime == "image/gif":
-            ext = "gif"
-        elif mime in ("image/jpeg", "image/jpg"):
-            ext = "jpg"
-        else:
-            raise ValueError("Поддерживаются только PNG, JPEG, WEBP и GIF")
-        s = b64_part
-    try:
-        raw_bytes = base64.b64decode(s, validate=True)
-    except Exception:
-        raise ValueError("Некорректные данные изображения (base64)")
-    if not raw_bytes:
-        raise ValueError("Пустой файл изображения")
-    if len(raw_bytes) > MAX_PHOTO_RAW_BYTES:
-        raise ValueError("Изображение больше 5.5 МБ")
-    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        ext = "png"
-    elif raw_bytes.startswith(b"\xff\xd8\xff"):
-        ext = "jpg"
-    elif raw_bytes.startswith((b"GIF87a", b"GIF89a")):
-        ext = "gif"
-    elif raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
-        ext = "webp"
-    else:
-        raise ValueError("Файл не является корректным изображением (PNG/JPG/WEBP/GIF)")
-    return raw_bytes, f"broadcast.{ext}"
-
-
-def send_telegram_content(chat_id: int, text: str, photo_bytes: bytes | None, photo_name: str, cached_file_id: str | None = None):
-    clean_text = (text or "").strip()
-    if photo_bytes is None and not cached_file_id:
-        bot.send_message(chat_id, clean_text[:4000])
-        return None
-
-    media = cached_file_id
-    if media is None:
-        bio = io.BytesIO(photo_bytes)
-        bio.name = photo_name or "photo.jpg"
-        media = bio
-
-    if len(clean_text) <= 1024:
-        sent = bot.send_photo(chat_id, media, caption=clean_text if clean_text else None)
-    else:
-        sent = bot.send_photo(chat_id, media, caption=None)
-        bot.send_message(chat_id, clean_text[:4000])
-
-    if cached_file_id is None and getattr(sent, "photo", None):
-        return sent.photo[-1].file_id
-    return cached_file_id
-
-
-# ============================================================
-# ЛОГИКА БОТА: СИНХРОНИЗАЦИЯ С БД GDZgo И TELEGRAM STARS
-# ============================================================
-def upsert_tg_user(tg_user, gdz_uid: int | None = None, gdz_login: str | None = None):
-    if not tg_user:
-        return
-
-    def _op(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO banka_bot_users (
-                    tg_user_id, tg_username, tg_first_name, tg_last_name,
-                    gdz_user_id, gdz_login, is_blocked, started_at, last_seen_at
-                )
-                VALUES (%s, %s, %s, %s, COALESCE(%s, 0), COALESCE(%s, ''), FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT (tg_user_id) DO UPDATE SET
-                    tg_username = EXCLUDED.tg_username,
-                    tg_first_name = EXCLUDED.tg_first_name,
-                    tg_last_name = EXCLUDED.tg_last_name,
-                    is_blocked = FALSE,
-                    last_seen_at = CURRENT_TIMESTAMP,
-                    gdz_user_id = CASE WHEN EXCLUDED.gdz_user_id > 0 THEN EXCLUDED.gdz_user_id ELSE banka_bot_users.gdz_user_id END,
-                    gdz_login = CASE WHEN EXCLUDED.gdz_login <> '' THEN EXCLUDED.gdz_login ELSE banka_bot_users.gdz_login END;
-                """,
-                (
-                    int(tg_user.id),
-                    (tg_user.username or "")[:120],
-                    (tg_user.first_name or "")[:160],
-                    (tg_user.last_name or "")[:160],
-                    gdz_uid if (gdz_uid and gdz_uid > 0) else None,
-                    (gdz_login or "")[:120] if gdz_login else None,
-                ),
-            )
-        conn.commit()
-
-    with_db(_op)
-
-
-def get_linked_gdz_account(tg_user_id: int):
-    def _op(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT gdz_user_id, gdz_login FROM banka_bot_users WHERE tg_user_id = %s LIMIT 1;",
-                (tg_user_id,),
-            )
-            row = cur.fetchone()
-            if not row or not row[0]:
-                return None
-            gdz_uid = int(row[0])
-            if not _table_exists(cur, "banka_profiles_vault"):
-                return {"id": gdz_uid, "login": row[1] or "", "name": row[1] or "", "coins": 0, "is_vip": False}
-            cur.execute(
-                """
-                SELECT rec_uid, entry_tag,
-                       COALESCE(NULLIF(TRIM(title_first || ' ' || title_last), ''), entry_tag) AS full_name,
-                       COALESCE(vault_tokens, 0) AS coins,
-                       (COALESCE(vip_flag, FALSE) AND (premium_until_ms IS NULL OR premium_until_ms > %s)) AS is_vip
-                FROM banka_profiles_vault
-                WHERE rec_uid = %s LIMIT 1;
-                """,
-                (now_ms(), gdz_uid),
-            )
-            u = cur.fetchone()
-            if not u:
-                return None
-            return {"id": int(u[0]), "login": u[1], "name": u[2], "coins": int(u[3]), "is_vip": bool(u[4])}
-
-    return with_db(_op)
-
-
-def fetch_shop_config() -> dict:
-    cfg = {
-        "stars_10d_price": 75,
-        "stars_30d_price": 170,
-        "coins_per_star": 2.0,
-        "prem_discount_pct": 0,
-    }
-    try:
-        def _op(conn):
+        with db_connect() as conn:
             with conn.cursor() as cur:
-                if not _table_exists(cur, "banka_system_config"):
-                    return None
                 cur.execute(
                     """
-                    SELECT COALESCE(stars_10d_price, 75),
-                           COALESCE(stars_30d_price, 170),
-                           COALESCE(coins_per_star, 2.0),
-                           COALESCE(prem_discount_pct, 0)
-                    FROM banka_system_config WHERE cfg_uid = 1 LIMIT 1;
-                    """
+                    INSERT INTO banka_bot_users (
+                        tg_user_id, tg_username, first_name, last_name,
+                        linked_gdz_uid, linked_gdz_login, first_seen_ms, last_seen_ms
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (tg_user_id) DO UPDATE SET
+                        tg_username = CASE WHEN EXCLUDED.tg_username <> '' THEN EXCLUDED.tg_username ELSE banka_bot_users.tg_username END,
+                        first_name = CASE WHEN EXCLUDED.first_name <> '' THEN EXCLUDED.first_name ELSE banka_bot_users.first_name END,
+                        last_name = CASE WHEN EXCLUDED.last_name <> '' THEN EXCLUDED.last_name ELSE banka_bot_users.last_name END,
+                        linked_gdz_uid = CASE WHEN EXCLUDED.linked_gdz_uid > 0 THEN EXCLUDED.linked_gdz_uid ELSE banka_bot_users.linked_gdz_uid END,
+                        linked_gdz_login = CASE WHEN EXCLUDED.linked_gdz_login <> '' THEN EXCLUDED.linked_gdz_login ELSE banka_bot_users.linked_gdz_login END,
+                        last_seen_ms = EXCLUDED.last_seen_ms;
+                    """,
+                    (tg_user.id, uname, fname, lname, l_uid, l_login, ts, ts),
                 )
-                return cur.fetchone()
-
-        row = with_db(_op)
-        if row:
-            cfg["stars_10d_price"] = max(1, int(row[0]))
-            cfg["stars_30d_price"] = max(1, int(row[1]))
-            cfg["coins_per_star"] = max(0.1, float(row[2]))
-            cfg["prem_discount_pct"] = max(0, min(90, int(row[3])))
     except Exception:
         pass
-    return cfg
 
 
-def discounted_stars(base_stars: int, discount_pct: int) -> int:
-    if discount_pct <= 0:
-        return max(1, int(base_stars))
-    return max(1, round(base_stars * (100 - discount_pct) / 100.0))
+def get_runtime_pricing() -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(stars_10d_price, 50) AS stars_10d_price,
+                       COALESCE(stars_30d_price, 100) AS stars_30d_price,
+                       COALESCE(coins_per_star, 5.0) AS coins_per_star,
+                       COALESCE(prem_discount_pct, 0) AS prem_discount_pct
+                FROM banka_system_config
+                WHERE cfg_uid = 1;
+                """
+            )
+            row = cur.fetchone() or {}
+    raw10 = max(1, int(row.get("stars_10d_price") or 50))
+    raw30 = max(1, int(row.get("stars_30d_price") or 100))
+    disc = max(0, min(99, int(row.get("prem_discount_pct") or 0)))
+    rate = float(row.get("coins_per_star") or 5.0)
+    if rate <= 0:
+        rate = 5.0
+    eff10 = max(1, int(math.ceil(raw10 * (100 - disc) / 100.0)))
+    eff30 = max(1, int(math.ceil(raw30 * (100 - disc) / 100.0)))
+    return {
+        "stars_10d": eff10,
+        "stars_30d": eff30,
+        "coins_per_star": rate,
+        "discount_pct": disc,
+    }
 
 
-def gen_pay_code() -> str:
+def generate_pay_code() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(10))
+    return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
-def create_bot_stars_order(tg_user_id: int, buyer_uid: int, buyer_login: str, item_kind: str, plan_days: int, coins_amount: int, target_bg_id: int, stars_amount: int):
+def describe_order(row: dict[str, Any]) -> tuple[str, str]:
+    kind = str(row.get("item_kind") or "").upper()
+    if kind == "COINS":
+        coins = int(row.get("coins_amount") or 0)
+        return (
+            f"{coins} монет GDZgo",
+            f"Пополнение баланса на {coins} монет для аккаунта @{row.get('buyer_login') or 'user'}",
+        )
+    if kind == "BACKGROUND":
+        bg_title = str(row.get("bg_title") or f"Фон #{row.get('target_bg_id') or 0}")
+        return (
+            f"Фон «{bg_title}»",
+            f"Эксклюзивный фон профиля для аккаунта @{row.get('buyer_login') or 'user'}",
+        )
+    days = int(row.get("plan_days") or 30)
+    return (
+        f"GDZgo Premium ({days} дн.)",
+        f"Премиум-доступ на {days} дней для аккаунта @{row.get('buyer_login') or 'user'}",
+    )
+
+
+def insert_user_notice(
+    cur: psycopg.Cursor,
+    target_uid: int,
+    kind_tag: str,
+    title_txt: str,
+    body_txt: str,
+    issuer_label: str = "Telegram Stars",
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO banka_user_notices (
+            target_uid, kind_tag, title_txt, body_txt, reason_txt, issuer_label, seen_flag
+        )
+        VALUES (%s, %s, %s, %s, '', %s, FALSE);
+        """,
+        (target_uid, kind_tag, title_txt[:160], body_txt, issuer_label[:150]),
+    )
+
+
+def grant_timed_premium_in_tx(
+    cur: psycopg.Cursor,
+    user_id: int,
+    days: int,
+    stars_amount: int,
+) -> None:
+    cur.execute(
+        "SELECT vip_flag, premium_until_ms FROM banka_profiles_vault WHERE rec_uid = %s FOR UPDATE;",
+        (user_id,),
+    )
+    u = cur.fetchone()
+    if not u:
+        raise RuntimeError("Пользователь не найден")
+
+    curr_vip = bool(u.get("vip_flag"))
+    curr_until = u.get("premium_until_ms")
     cur_ms = now_ms()
+    is_permanent_admin_vip = curr_vip and curr_until is None
+    if is_permanent_admin_vip:
+        new_until = None
+    else:
+        base = curr_until if (curr_vip and curr_until is not None and int(curr_until) > cur_ms) else cur_ms
+        new_until = int(base) + int(days) * 86_400_000
 
-    def _op(conn):
+    cur.execute(
+        "UPDATE banka_profiles_vault SET vip_flag = TRUE, premium_until_ms = %s WHERE rec_uid = %s;",
+        (new_until, user_id),
+    )
+    insert_user_notice(
+        cur,
+        user_id,
+        "PREMIUM_GRANTED",
+        f"Оплата ⭐ {stars_amount} подтверждена!",
+        f"Через Telegram Stars оплачен и активирован Premium на {days} дней.",
+        "Telegram Stars",
+    )
+
+    # Реферальный бонус пригласившему (+30 монет) — как в Android-приложении
+    cur.execute(
+        """
+        SELECT referred_by_uid, entry_tag, title_first, title_last
+        FROM banka_profiles_vault
+        WHERE rec_uid = %s;
+        """,
+        (user_id,),
+    )
+    ref_row = cur.fetchone()
+    inviter_id = int(ref_row.get("referred_by_uid") or 0) if ref_row else 0
+    if inviter_id > 0 and inviter_id != user_id:
+        bonus = 30
+        buyer_label = (
+            f"{ref_row.get('title_first') or ''} {ref_row.get('title_last') or ''}".strip()
+            or (ref_row.get("entry_tag") or "Пользователь")
+        )
+        cur.execute(
+            "UPDATE banka_profiles_vault SET vault_tokens = vault_tokens + %s WHERE rec_uid = %s;",
+            (bonus, inviter_id),
+        )
+        cur.execute(
+            "UPDATE banka_profiles_vault SET referral_earned_coins = COALESCE(referral_earned_coins, 0) + %s WHERE rec_uid = %s;",
+            (bonus, user_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO banka_referral_ledger (inviter_uid, referral_uid, reward_type, coins_delta, note_txt)
+            VALUES (%s, %s, 'PREMIUM_BUY', %s, %s);
+            """,
+            (inviter_id, user_id, bonus, f"Покупка Premium: {days} дней за Telegram Stars"),
+        )
+        insert_user_notice(
+            cur,
+            inviter_id,
+            "REFERRAL_REWARD",
+            f"+{bonus} монет за покупку Premium рефералом",
+            f"Ваш реферал {buyer_label} оформил Premium ({days} дней, Telegram Stars). Вам начислено +{bonus} монет!",
+            "Реферальная программа",
+        )
+
+
+def delete_uncleaned_invoices_for_order(order_uid: int) -> None:
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT chat_id, message_id
+                    FROM banka_stars_invoices
+                    WHERE order_uid = %s AND COALESCE(cleaned_flag, FALSE) = FALSE;
+                    """,
+                    (order_uid,),
+                )
+                rows = cur.fetchall()
+                for inv in rows:
+                    try:
+                        bot.delete_message(int(inv["chat_id"]), int(inv["message_id"]))
+                    except Exception:
+                        pass
+                if rows:
+                    cur.execute(
+                        "UPDATE banka_stars_invoices SET cleaned_flag = TRUE WHERE order_uid = %s;",
+                        (order_uid,),
+                    )
+    except Exception:
+        pass
+
+
+def send_stars_invoice_for_order(chat_id: int, order: dict[str, Any]) -> None:
+    order_uid = int(order["order_uid"])
+    stars_amt = int(order["stars_amount"])
+    pay_code = str(order["pay_code"]).upper()
+    title, desc = describe_order(order)
+
+    # Закрываем старые счета по этому заказу, если они были
+    delete_uncleaned_invoices_for_order(order_uid)
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton(
+            text=f"⭐ Оплатить {stars_amt} Stars",
+            pay=True,
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            text="❌ Отменить оплату",
+            callback_data=f"cancel_order:{order_uid}",
+        )
+    )
+
+    msg = bot.send_invoice(
+        chat_id=chat_id,
+        title=title[:32],
+        description=f"{desc}\nКод заказа: {pay_code}"[:255],
+        invoice_payload=f"gdz_order:{order_uid}:{pay_code}",
+        provider_token="",  # Обязательно пустая строка для Telegram Stars (XTR)
+        currency="XTR",
+        prices=[types.LabeledPrice(label=title[:32], amount=stars_amt)],
+        reply_markup=kb,
+    )
+
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO banka_stars_invoices (order_uid, chat_id, message_id, cleaned_flag, created_ms)
+                    VALUES (%s, %s, %s, FALSE, %s);
+                    """,
+                    (order_uid, chat_id, msg.message_id, now_ms()),
+                )
+    except Exception:
+        pass
+
+
+def create_order_for_tg_buyer(
+    gdz_user: dict[str, Any],
+    tg_user_id: int,
+    item_kind: str,
+    plan_days: int = 0,
+    coins_amount: int = 0,
+    target_bg_id: int = 0,
+    stars_amount: int = 1,
+) -> dict[str, Any]:
+    buyer_uid = int(gdz_user["rec_uid"])
+    buyer_login = str(gdz_user.get("entry_tag") or "").strip()[:100]
+    ts = now_ms()
+    with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE banka_stars_orders
                 SET status_tag = 'CANCELLED'
-                WHERE buyer_uid = %s AND status_tag = 'PENDING';
+                WHERE buyer_uid = %s AND status_tag = 'PENDING'
+                RETURNING order_uid;
                 """,
                 (buyer_uid,),
             )
-            for _ in range(10):
-                code = gen_pay_code()
+            cancelled = cur.fetchall()
+
+            inserted = None
+            for _ in range(8):
+                code = generate_pay_code()
                 cur.execute(
                     """
                     INSERT INTO banka_stars_orders (
@@ -536,562 +488,660 @@ def create_bot_stars_order(tg_user_id: int, buyer_uid: int, buyer_login: str, it
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, FALSE, %s)
                     ON CONFLICT (pay_code) DO NOTHING
-                    RETURNING order_uid, pay_code;
+                    RETURNING order_uid, pay_code, buyer_uid, buyer_login, item_kind,
+                              plan_days, coins_amount, target_bg_id, stars_amount, status_tag;
                     """,
                     (
                         code,
                         buyer_uid,
-                        buyer_login[:100],
-                        item_kind.upper(),
-                        max(0, plan_days),
-                        max(0, coins_amount),
-                        max(0, target_bg_id),
-                        max(1, stars_amount),
+                        buyer_login,
+                        item_kind,
+                        max(0, int(plan_days)),
+                        max(0, int(coins_amount)),
+                        max(0, int(target_bg_id)),
+                        max(1, int(stars_amount)),
                         tg_user_id,
-                        cur_ms,
+                        ts,
                     ),
                 )
                 row = cur.fetchone()
                 if row:
-                    conn.commit()
-                    return int(row[0]), str(row[1])
-        raise RuntimeError("Не удалось создать код оплаты")
+                    inserted = row
+                    break
+            if not inserted:
+                raise RuntimeError("Не удалось создать код заказа")
+            if target_bg_id > 0:
+                cur.execute(
+                    "SELECT title_txt FROM banka_shop_backgrounds WHERE bg_uid = %s;",
+                    (target_bg_id,),
+                )
+                bg = cur.fetchone()
+                inserted["bg_title"] = bg["title_txt"] if bg else f"Фон #{target_bg_id}"
 
-    return with_db(_op)
-
-
-def send_stars_invoice_for_order(chat_id: int, order_row: dict):
-    order_uid = int(order_row["order_uid"])
-    pay_code = str(order_row["pay_code"])
-    item_kind = str(order_row["item_kind"]).upper()
-    stars_amount = max(1, int(order_row["stars_amount"]))
-    plan_days = int(order_row["plan_days"] or 0)
-    coins_amount = int(order_row["coins_amount"] or 0)
-    bg_title = order_row.get("bg_title") or ""
-
-    if item_kind == "PREMIUM":
-        title = f"GDZgo Premium ({plan_days} дн.)"
-        desc = f"Подписка Premium на {plan_days} дн. для аккаунта {order_row.get('buyer_login') or ''}".strip()
-        label = f"Premium {plan_days} дн."
-    elif item_kind == "COINS":
-        title = f"{coins_amount} монет GDZgo"
-        desc = f"Зачисление {coins_amount} монет на баланс {order_row.get('buyer_login') or ''}".strip()
-        label = f"{coins_amount} монет"
-    elif item_kind == "BACKGROUND":
-        title = f"Фон «{bg_title or 'GDZgo'}»"
-        desc = f"Покупка фона профиля в GDZgo для {order_row.get('buyer_login') or ''}".strip()
-        label = "Фон профиля"
-    else:
-        title = "Покупка GDZgo"
-        desc = "Оплата через Telegram Stars"
-        label = "Заказ GDZgo"
-
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(text=f"⭐ Оплатить {stars_amount} Stars", pay=True))
-    kb.add(types.InlineKeyboardButton(text="❌ Отменить счёт", callback_data=f"cancel_order:{order_uid}"))
-
-    sent = bot.send_invoice(
-        chat_id=chat_id,
-        title=title[:32],
-        description=desc[:255],
-        invoice_payload=f"gdz_order:{order_uid}:{pay_code}",
-        provider_token="",
-        currency="XTR",
-        prices=[types.LabeledPrice(label=label[:32], amount=stars_amount)],
-        reply_markup=kb,
-    )
-
-    def _op(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO banka_stars_invoices (order_uid, pay_code, chat_id, message_id, cleaned_flag)
-                VALUES (%s, %s, %s, %s, FALSE)
-                ON CONFLICT (order_uid, chat_id, message_id) DO UPDATE SET cleaned_flag = FALSE;
-                """,
-                (order_uid, pay_code, int(chat_id), int(sent.message_id)),
-            )
-        conn.commit()
-
-    with_db(_op)
+    for c in cancelled:
+        delete_uncleaned_invoices_for_order(int(c["order_uid"]))
+    return inserted
 
 
-def mark_invoices_cleaned(order_uid: int, except_delete: bool = False):
-    def _op(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT chat_id, message_id
-                FROM banka_stars_invoices
-                WHERE order_uid = %s AND COALESCE(cleaned_flag, FALSE) = FALSE;
-                """,
-                (order_uid,),
-            )
-            rows = cur.fetchall()
-            cur.execute(
-                "UPDATE banka_stars_invoices SET cleaned_flag = TRUE WHERE order_uid = %s;",
-                (order_uid,),
-            )
-        conn.commit()
-        return rows
-
-    rows = with_db(_op)
-    if not except_delete:
-        for cid, mid in rows:
-            try:
-                bot.delete_message(int(cid), int(mid))
-            except Exception:
-                pass
-
-
-def main_menu_kb(linked_acc: dict | None) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
+def main_menu_markup(linked_login: str = "") -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("👑 Купить Premium", callback_data="menu:premium"),
-        types.InlineKeyboardButton("🪙 Купить монеты", callback_data="menu:coins"),
+        types.InlineKeyboardButton(
+            text="⭐ Купить в боте (Premium / Монеты / Фоны)",
+            callback_data="shop:menu",
+        )
     )
-    kb.add(
-        types.InlineKeyboardButton("🖼 Купить фоны", callback_data="menu:bgs"),
-        types.InlineKeyboardButton("👤 Мой профиль", callback_data="menu:profile"),
+    acc_text = (
+        f"🔄 Сменить аккаунт GDZgo (@{linked_login})"
+        if linked_login
+        else "🔗 Привязать аккаунт GDZgo"
     )
-    link_lbl = "🔄 Сменить аккаунт GDZgo" if linked_acc else "🔗 Привязать аккаунт GDZgo"
-    kb.add(types.InlineKeyboardButton(link_lbl, callback_data="menu:link"))
+    kb.add(types.InlineKeyboardButton(text=acc_text, callback_data="shop:link"))
     return kb
 
 
-@bot.message_handler(commands=["start"])
-def handle_start(message):
-    upsert_tg_user(message.from_user)
-    parts = (message.text or "").strip().split(maxsplit=1)
-    if len(parts) == 2 and parts[1].startswith("pay_"):
-        pay_code = parts[1][4:].strip().upper()
+def find_gdz_user_by_login(login_text: str) -> dict[str, Any] | None:
+    clean = login_text.strip().lstrip("@").lower()
+    if not clean:
+        return None
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rec_uid, entry_tag, title_first, title_last,
+                       COALESCE(ban_flag, FALSE) AS ban_flag,
+                       COALESCE(vip_flag, FALSE) AS vip_flag,
+                       COALESCE(vault_tokens, 0) AS vault_tokens
+                FROM banka_profiles_vault
+                WHERE LOWER(entry_tag) = %s OR LOWER(chat_username) = %s
+                LIMIT 1;
+                """,
+                (clean, clean),
+            )
+            return cur.fetchone()
 
-        def _fetch_order(conn):
+
+def get_linked_gdz_user(tg_user_id: int) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT u.rec_uid, u.entry_tag, u.title_first, u.title_last,
+                       COALESCE(u.ban_flag, FALSE) AS ban_flag,
+                       COALESCE(u.vip_flag, FALSE) AS vip_flag,
+                       COALESCE(u.vault_tokens, 0) AS vault_tokens
+                FROM banka_bot_users bu
+                JOIN banka_profiles_vault u ON u.rec_uid = bu.linked_gdz_uid
+                WHERE bu.tg_user_id = %s AND bu.linked_gdz_uid > 0
+                LIMIT 1;
+                """,
+                (tg_user_id,),
+            )
+            return cur.fetchone()
+
+
+def send_shop_categories(chat_id: int, gdz_user: dict[str, Any]) -> None:
+    pricing = get_runtime_pricing()
+    rate = pricing["coins_per_star"]
+    disc_note = f" (скидка -{pricing['discount_pct']}%)" if pricing["discount_pct"] > 0 else ""
+    text = (
+        f"🛍 <b>Магазин GDZgo</b>\n"
+        f"Аккаунт: <code>@{html.escape(str(gdz_user['entry_tag']))}</code>\n"
+        f"Баланс монет: <b>{int(gdz_user['vault_tokens'])}</b>\n\n"
+        f"Выберите товар для мгновенной оплаты в Telegram Stars{disc_note}:"
+    )
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            text=f"👑 Premium 10 дней — ⭐ {pricing['stars_10d']}",
+            callback_data="buy:prem10",
+        ),
+        types.InlineKeyboardButton(
+            text=f"👑 Premium 30 дней — ⭐ {pricing['stars_30d']}",
+            callback_data="buy:prem30",
+        ),
+        types.InlineKeyboardButton(
+            text=f"🪙 Купить монеты (1⭐ ≈ {rate:g} монет)",
+            callback_data="shop:coins",
+        ),
+        types.InlineKeyboardButton(
+            text="🎨 Фоны профиля за ⭐",
+            callback_data="shop:bgs",
+        ),
+        types.InlineKeyboardButton(
+            text="🔄 Сменить аккаунт",
+            callback_data="shop:link",
+        ),
+    )
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+@bot.message_handler(commands=["start"])
+def handle_start(message: types.Message) -> None:
+    upsert_bot_user(message.from_user)
+    parts = (message.text or "").strip().split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if arg.lower().startswith("pay_"):
+        code = arg[4:].strip().upper()
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT o.order_uid, o.pay_code, o.buyer_uid, o.buyer_login, o.item_kind,
-                           o.plan_days, o.coins_amount, o.target_bg_id, o.stars_amount, o.status_tag
+                    SELECT o.order_uid, o.pay_code, o.buyer_uid, o.buyer_login,
+                           o.item_kind, o.plan_days, o.coins_amount, o.target_bg_id,
+                           o.stars_amount, o.status_tag,
+                           COALESCE(b.title_txt, '') AS bg_title
                     FROM banka_stars_orders o
-                    WHERE o.pay_code = %s LIMIT 1;
+                    LEFT JOIN banka_shop_backgrounds b ON b.bg_uid = o.target_bg_id
+                    WHERE UPPER(o.pay_code) = %s
+                    LIMIT 1;
                     """,
-                    (pay_code,),
+                    (code,),
                 )
-                row = cur.fetchone()
-                if not row or row[9] != "PENDING":
-                    return row, ""
-                bg_title = ""
-                if int(row[7] or 0) > 0 and _table_exists(cur, "banka_shop_backgrounds"):
-                    cur.execute("SELECT title_txt FROM banka_shop_backgrounds WHERE bg_uid = %s LIMIT 1;", (int(row[7]),))
-                    b = cur.fetchone()
-                    if b:
-                        bg_title = b[0]
-                cur.execute(
-                    "UPDATE banka_stars_orders SET telegram_user_id = %s WHERE order_uid = %s;",
-                    (int(message.from_user.id), int(row[0])),
-                )
-            conn.commit()
-            return row, bg_title
-
-        row, bg_title = with_db(_fetch_order)
-        if not row:
-            bot.send_message(message.chat.id, "❌ Счёт с таким кодом не найден.")
-            return
-        if row[9] == "PAID":
-            bot.send_message(message.chat.id, "✅ Этот заказ уже оплачен!")
-            return
-        if row[9] != "PENDING":
-            bot.send_message(message.chat.id, "⚠️ Этот счёт был отменён в приложении.")
-            return
-
-        upsert_tg_user(message.from_user, gdz_uid=int(row[2]), gdz_login=row[3])
-        send_stars_invoice_for_order(
-            message.chat.id,
-            {
-                "order_uid": row[0],
-                "pay_code": row[1],
-                "buyer_uid": row[2],
-                "buyer_login": row[3],
-                "item_kind": row[4],
-                "plan_days": row[5],
-                "coins_amount": row[6],
-                "target_bg_id": row[7],
-                "stars_amount": row[8],
-                "bg_title": bg_title,
-            },
-        )
-        return
-
-    acc = get_linked_gdz_account(message.from_user.id)
-    if acc:
-        text = (
-            f"👋 Привет, {message.from_user.first_name or 'друг'}!\n\n"
-            f"Привязанный аккаунт GDZgo: {acc['name']} (@{acc['login']})\n"
-            f"🪙 Монеты: {acc['coins']} | 👑 VIP: {'Да' if acc['is_vip'] else 'Нет'}\n\n"
-            f"Выбирай что хочешь купить прямо здесь:"
-        )
-    else:
-        text = (
-            f"👋 Привет, {message.from_user.first_name or 'друг'}!\n\n"
-            f"Здесь можно оплатить GDZgo Premium, монеты и фоны за Telegram Stars ⭐.\n"
-            f"Для покупки прямо из бота сначала привяжи свой аккаунт GDZgo командой:\n"
-            f"/link <логин> <5-значный код защиты>"
-        )
-    bot.send_message(message.chat.id, text, reply_markup=main_menu_kb(acc))
-
-
-@bot.message_handler(commands=["link"])
-def handle_link_cmd(message):
-    upsert_tg_user(message.from_user)
-    parts = (message.text or "").strip().split()
-    if len(parts) != 3:
-        bot.send_message(
-            message.chat.id,
-            "Использование: /link <логин_GDZgo> <5-значный_код_защиты>\n"
-            "Код защиты можно посмотреть в профиле в приложении GDZgo.",
-        )
-        return
-    login_arg = parts[1].strip()
-    code_arg = parts[2].strip().upper()
-
-    def _op(conn):
-        with conn.cursor() as cur:
-            if not _table_exists(cur, "banka_profiles_vault"):
-                return "no_table", None
-            cur.execute(
-                """
-                SELECT rec_uid, entry_tag,
-                       COALESCE(NULLIF(TRIM(title_first || ' ' || title_last), ''), entry_tag)
-                FROM banka_profiles_vault
-                WHERE LOWER(entry_tag) = LOWER(%s) AND UPPER(COALESCE(guard_code, '')) = %s
-                LIMIT 1;
-                """,
-                (login_arg, code_arg),
+                order = cur.fetchone()
+                if order and order["status_tag"] == "PENDING" and message.from_user:
+                    cur.execute(
+                        "UPDATE banka_stars_orders SET telegram_user_id = %s WHERE order_uid = %s;",
+                        (message.from_user.id, order["order_uid"]),
+                    )
+        if not order:
+            bot.send_message(
+                message.chat.id,
+                f"Заказ с кодом <code>{html.escape(code)}</code> не найден.",
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
             )
-            return "ok", cur.fetchone()
+            return
+        if order["status_tag"] == "PAID":
+            bot.send_message(
+                message.chat.id,
+                f"✅ Заказ <code>{html.escape(code)}</code> уже оплачен!",
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(str(order.get("buyer_login") or "")),
+            )
+            return
+        if order["status_tag"] != "PENDING":
+            bot.send_message(
+                message.chat.id,
+                f"❌ Заказ <code>{html.escape(code)}</code> отменён. Создайте новый счёт в приложении или в боте.",
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(str(order.get("buyer_login") or "")),
+            )
+            return
 
-    st, u = with_db(_op)
-    if st == "no_table":
-        bot.send_message(message.chat.id, "❌ База пользователей ещё не инициализирована.")
+        if message.from_user:
+            upsert_bot_user(
+                message.from_user,
+                linked_uid=int(order["buyer_uid"]),
+                linked_login=str(order.get("buyer_login") or ""),
+            )
+        send_stars_invoice_for_order(message.chat.id, order)
         return
-    if not u:
-        bot.send_message(message.chat.id, "❌ Неверный логин или код защиты.")
-        return
-    upsert_tg_user(message.from_user, gdz_uid=int(u[0]), gdz_login=u[1])
-    acc = get_linked_gdz_account(message.from_user.id)
+
+    linked = get_linked_gdz_user(message.from_user.id) if message.from_user else None
+    linked_login = str(linked["entry_tag"]) if linked else ""
     bot.send_message(
         message.chat.id,
-        f"✅ Аккаунт привязан: {u[2]} (@{u[1]})",
-        reply_markup=main_menu_kb(acc),
+        "⭐ <b>Официальный бот оплаты GDZgo</b>\n\n"
+        "• Нажмите «Оплатить в Telegram Stars» в приложении GDZgo — и счёт откроется здесь автоматически.\n"
+        "• Либо оформляйте покупки прямо в этом боте через меню ниже.",
+        parse_mode="HTML",
+        reply_markup=main_menu_markup(linked_login),
     )
 
 
 @bot.callback_query_handler(func=lambda c: True)
-def handle_callbacks(call):
-    upsert_tg_user(call.from_user)
-    data = call.data or ""
+def handle_callback(call: types.CallbackQuery) -> None:
+    upsert_bot_user(call.from_user)
+    data = (call.data or "").strip()
+    chat_id = call.message.chat.id if call.message else call.from_user.id
 
     if data.startswith("cancel_order:"):
         try:
-            oid = int(data.split(":", 1)[1])
-        except Exception:
+            order_uid = int(data.split(":", 1)[1])
+        except ValueError:
             bot.answer_callback_query(call.id, "Некорректный заказ")
             return
-
-        def _cancel(conn):
+        with db_connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE banka_stars_orders SET status_tag = 'CANCELLED' WHERE order_uid = %s AND status_tag = 'PENDING';",
-                    (oid,),
-                )
-            conn.commit()
-
-        with_db(_cancel)
-        mark_invoices_cleaned(oid, except_delete=False)
-        bot.answer_callback_query(call.id, "Счёт отменён")
-        return
-
-    acc = get_linked_gdz_account(call.from_user.id)
-
-    if data == "menu:home":
-        bot.answer_callback_query(call.id)
-        try:
-            bot.edit_message_text(
-                "🏠 Главное меню GDZgo Stars",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=main_menu_kb(acc),
-            )
-        except Exception:
-            bot.send_message(call.message.chat.id, "🏠 Главное меню", reply_markup=main_menu_kb(acc))
-        return
-
-    if data == "menu:link":
-        bot.answer_callback_query(call.id)
-        bot.send_message(
-            call.message.chat.id,
-            "🔗 Отправь команду:\n/link <логин_GDZgo> <5-значный_код_защиты>",
-        )
-        return
-
-    if data == "menu:profile":
-        bot.answer_callback_query(call.id)
-        if not acc:
-            bot.send_message(call.message.chat.id, "⚠️ Аккаунт не привязан. Используй /link <логин> <код>")
-            return
-        bot.send_message(
-            call.message.chat.id,
-            f"👤 Профиль: {acc['name']} (@{acc['login']})\n"
-            f"🪙 Монет: {acc['coins']}\n"
-            f"👑 Premium: {'Активен' if acc['is_vip'] else 'Нет'}",
-            reply_markup=main_menu_kb(acc),
-        )
-        return
-
-    if not acc:
-        bot.answer_callback_query(call.id, "Сначала привяжи аккаунт через /link", show_alert=True)
-        return
-
-    cfg = fetch_shop_config()
-
-    if data == "menu:premium":
-        bot.answer_callback_query(call.id)
-        s10 = discounted_stars(cfg["stars_10d_price"], cfg["prem_discount_pct"])
-        s30 = discounted_stars(cfg["stars_30d_price"], cfg["prem_discount_pct"])
-        disc_txt = f" (скидка {cfg['prem_discount_pct']}%!)" if cfg["prem_discount_pct"] > 0 else ""
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            types.InlineKeyboardButton(f"👑 10 дней — ⭐ {s10} Stars", callback_data=f"buy_prem:10:{s10}"),
-            types.InlineKeyboardButton(f"👑 30 дней — ⭐ {s30} Stars", callback_data=f"buy_prem:30:{s30}"),
-            types.InlineKeyboardButton("⬅️ Назад", callback_data="menu:home"),
-        )
-        bot.edit_message_text(
-            f"👑 Покупка GDZgo Premium{disc_txt}\nАккаунт: @{acc['login']}",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=kb,
-        )
-        return
-
-    if data == "menu:coins":
-        bot.answer_callback_query(call.id)
-        rate = cfg["coins_per_star"]
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        for st in (25, 50, 100, 250, 500):
-            coins = max(1, int(round(st * rate)))
-            kb.add(types.InlineKeyboardButton(f"🪙 {coins} монет — ⭐ {st} Stars", callback_data=f"buy_coins:{st}:{coins}"))
-        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu:home"))
-        bot.edit_message_text(
-            f"🪙 Покупка монет GDZgo (курс: {rate:g} монет за 1 ⭐)\nАккаунт: @{acc['login']}",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=kb,
-        )
-        return
-
-    if data == "menu:bgs":
-        bot.answer_callback_query(call.id)
-        cur_ms = now_ms()
-
-        def _fetch_bgs(conn):
-            with conn.cursor() as cur:
-                if not _table_exists(cur, "banka_shop_backgrounds"):
-                    return []
                 cur.execute(
                     """
-                    SELECT bg_uid, title_txt, COALESCE(price_stars, 0), COALESCE(discount_pct, 0)
-                    FROM banka_shop_backgrounds
-                    WHERE COALESCE(is_active, TRUE) = TRUE
-                      AND COALESCE(price_stars, 0) > 0
-                      AND (publish_at_ms IS NULL OR publish_at_ms <= %s)
-                      AND (expires_ms IS NULL OR expires_ms > %s)
-                      AND (max_qty IS NULL OR COALESCE(sold_count, 0) < max_qty)
-                    ORDER BY bg_uid DESC
-                    LIMIT 20;
+                    UPDATE banka_stars_orders
+                    SET status_tag = 'CANCELLED'
+                    WHERE order_uid = %s AND status_tag = 'PENDING'
+                    RETURNING order_uid;
                     """,
-                    (cur_ms, cur_ms),
+                    (order_uid,),
                 )
-                return cur.fetchall()
+                cancelled = cur.fetchone()
+        delete_uncleaned_invoices_for_order(order_uid)
+        if call.message:
+            try:
+                bot.delete_message(chat_id, call.message.message_id)
+            except Exception:
+                pass
+        if cancelled:
+            bot.answer_callback_query(call.id, "Заказ и счёт отменены")
+            bot.send_message(chat_id, "❌ Оплата отменена, счёт в боте аннулирован.")
+        else:
+            bot.answer_callback_query(call.id, "Счёт уже закрыт")
+        return
 
-        bgs = with_db(_fetch_bgs)
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        if not bgs:
-            kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu:home"))
-            bot.edit_message_text("🖼 Сейчас нет фонов за Stars в продаже.", call.message.chat.id, call.message.message_id, reply_markup=kb)
+    if data == "shop:link":
+        with state_lock:
+            user_states[call.from_user.id] = {"step": "WAIT_LOGIN"}
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "Введите ваш логин (<code>@login</code>) из приложения GDZgo:",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "shop:menu":
+        bot.answer_callback_query(call.id)
+        gdz_user = get_linked_gdz_user(call.from_user.id)
+        if not gdz_user:
+            with state_lock:
+                user_states[call.from_user.id] = {"step": "WAIT_LOGIN"}
+            bot.send_message(
+                chat_id,
+                "Сначала укажите ваш логин (<code>@login</code>) из приложения GDZgo:",
+                parse_mode="HTML",
+            )
             return
-        for bg_uid, title_txt, price_s, disc in bgs:
-            final_s = discounted_stars(int(price_s), int(disc))
-            kb.add(types.InlineKeyboardButton(f"🖼 {title_txt} — ⭐ {final_s} Stars", callback_data=f"buy_bg:{bg_uid}"))
-        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu:home"))
-        bot.edit_message_text(
-            f"🖼 Доступные фоны профиля за Stars\nАккаунт: @{acc['login']}",
-            call.message.chat.id,
-            call.message.message_id,
+        if gdz_user["ban_flag"]:
+            bot.send_message(chat_id, "⛔ Этот аккаунт GDZgo заблокирован.")
+            return
+        send_shop_categories(chat_id, gdz_user)
+        return
+
+    gdz_user = get_linked_gdz_user(call.from_user.id)
+    if not gdz_user:
+        bot.answer_callback_query(call.id, "Сначала привяжите аккаунт GDZgo", show_alert=True)
+        return
+    if gdz_user["ban_flag"]:
+        bot.answer_callback_query(call.id, "Аккаунт заблокирован", show_alert=True)
+        return
+
+    pricing = get_runtime_pricing()
+
+    if data == "buy:prem10":
+        bot.answer_callback_query(call.id)
+        order = create_order_for_tg_buyer(
+            gdz_user,
+            call.from_user.id,
+            "PREMIUM_10",
+            plan_days=10,
+            stars_amount=pricing["stars_10d"],
+        )
+        send_stars_invoice_for_order(chat_id, order)
+        return
+
+    if data == "buy:prem30":
+        bot.answer_callback_query(call.id)
+        order = create_order_for_tg_buyer(
+            gdz_user,
+            call.from_user.id,
+            "PREMIUM_30",
+            plan_days=30,
+            stars_amount=pricing["stars_30d"],
+        )
+        send_stars_invoice_for_order(chat_id, order)
+        return
+
+    if data == "shop:coins":
+        bot.answer_callback_query(call.id)
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        for s_amt in (10, 25, 50, 100, 250):
+            coins = max(1, int(s_amt * pricing["coins_per_star"] + 0.5))
+            kb.add(
+                types.InlineKeyboardButton(
+                    text=f"⭐ {s_amt} → 🪙 {coins}",
+                    callback_data=f"buy:coins:{s_amt}",
+                )
+            )
+        kb.add(types.InlineKeyboardButton(text="✏️ Ввести свою сумму ⭐", callback_data="shop:coins_custom"))
+        kb.add(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="shop:menu"))
+        bot.send_message(
+            chat_id,
+            f"🪙 <b>Покупка монет</b>\nКурс: 1 ⭐ ≈ {pricing['coins_per_star']:g} монет.",
+            parse_mode="HTML",
             reply_markup=kb,
         )
         return
 
-    if data.startswith("buy_prem:"):
+    if data == "shop:coins_custom":
         bot.answer_callback_query(call.id)
-        _, d_s, _ = data.split(":")
-        days = int(d_s)
-        base = cfg["stars_10d_price"] if days == 10 else cfg["stars_30d_price"]
-        stars = discounted_stars(base, cfg["prem_discount_pct"])
-        oid, pcode = create_bot_stars_order(call.from_user.id, acc["id"], acc["login"], "PREMIUM", days, 0, 0, stars)
-        send_stars_invoice_for_order(
-            call.message.chat.id,
-            {"order_uid": oid, "pay_code": pcode, "buyer_uid": acc["id"], "buyer_login": acc["login"], "item_kind": "PREMIUM", "plan_days": days, "coins_amount": 0, "target_bg_id": 0, "stars_amount": stars},
-        )
+        with state_lock:
+            user_states[call.from_user.id] = {"step": "WAIT_COINS_STARS"}
+        bot.send_message(chat_id, "Введите количество Stars ⭐ (целое число больше 0):")
         return
 
-    if data.startswith("buy_coins:"):
+    if data.startswith("buy:coins:"):
+        try:
+            s_amt = max(1, int(data.split(":")[2]))
+        except ValueError:
+            bot.answer_callback_query(call.id, "Ошибка суммы")
+            return
         bot.answer_callback_query(call.id)
-        _, st_s, _ = data.split(":")
-        stars = max(1, int(st_s))
-        coins = max(1, int(round(stars * cfg["coins_per_star"])))
-        oid, pcode = create_bot_stars_order(call.from_user.id, acc["id"], acc["login"], "COINS", 0, coins, 0, stars)
-        send_stars_invoice_for_order(
-            call.message.chat.id,
-            {"order_uid": oid, "pay_code": pcode, "buyer_uid": acc["id"], "buyer_login": acc["login"], "item_kind": "COINS", "plan_days": 0, "coins_amount": coins, "target_bg_id": 0, "stars_amount": stars},
+        coins = max(1, int(s_amt * pricing["coins_per_star"] + 0.5))
+        order = create_order_for_tg_buyer(
+            gdz_user,
+            call.from_user.id,
+            "COINS",
+            coins_amount=coins,
+            stars_amount=s_amt,
         )
+        send_stars_invoice_for_order(chat_id, order)
         return
 
-    if data.startswith("buy_bg:"):
-        bg_id = int(data.split(":", 1)[1])
-        cur_ms = now_ms()
-
-        def _fetch_bg(conn):
+    if data == "shop:bgs":
+        bot.answer_callback_query(call.id)
+        ts = now_ms()
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT title_txt, COALESCE(price_stars, 0), COALESCE(discount_pct, 0)
+                    SELECT b.bg_uid, b.title_txt, COALESCE(b.price_stars, 0) AS price_stars,
+                           COALESCE(b.discount_pct, 0) AS discount_pct,
+                           COALESCE(b.is_limited, FALSE) AS is_limited,
+                           b.max_qty, COALESCE(b.sold_count, 0) AS sold_count,
+                           b.expires_ms, b.publish_at_ms
+                    FROM banka_shop_backgrounds b
+                    WHERE COALESCE(b.is_active, TRUE) = TRUE
+                      AND COALESCE(b.price_stars, 0) > 0
+                      AND (b.publish_at_ms IS NULL OR b.publish_at_ms <= %s)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM banka_user_backgrounds ub
+                          WHERE ub.owner_uid = %s AND ub.bg_uid = b.bg_uid
+                      )
+                    ORDER BY b.bg_uid DESC
+                    LIMIT 25;
+                    """,
+                    (ts, gdz_user["rec_uid"]),
+                )
+                bgs = cur.fetchall()
+
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        count_added = 0
+        for bg in bgs:
+            is_lim = bool(bg["is_limited"])
+            if is_lim and bg["expires_ms"] is not None and ts >= int(bg["expires_ms"]):
+                continue
+            if is_lim and bg["max_qty"] is not None and int(bg["max_qty"]) > 0 and int(bg["sold_count"]) >= int(bg["max_qty"]):
+                continue
+            raw_s = int(bg["price_stars"])
+            disc = max(0, min(99, int(bg["discount_pct"])))
+            eff_s = max(1, int(math.ceil(raw_s * (100 - disc) / 100.0))) if disc > 0 else raw_s
+            tag = " [Лимит]" if is_lim else ""
+            kb.add(
+                types.InlineKeyboardButton(
+                    text=f"🎨 {bg['title_txt']}{tag} — ⭐ {eff_s}",
+                    callback_data=f"buy:bg:{bg['bg_uid']}",
+                )
+            )
+            count_added += 1
+
+        kb.add(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="shop:menu"))
+        if count_added == 0:
+            bot.send_message(chat_id, "Нет доступных для покупки фонов за ⭐ (возможно, все уже куплены).", reply_markup=kb)
+        else:
+            bot.send_message(chat_id, "🎨 <b>Доступные фоны за Stars ⭐:</b>", parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("buy:bg:"):
+        try:
+            bg_uid = int(data.split(":")[2])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Некорректный фон")
+            return
+        ts = now_ms()
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bg_uid, title_txt, COALESCE(price_stars, 0) AS price_stars,
+                           COALESCE(discount_pct, 0) AS discount_pct,
+                           COALESCE(is_limited, FALSE) AS is_limited,
+                           max_qty, COALESCE(sold_count, 0) AS sold_count,
+                           expires_ms, publish_at_ms, COALESCE(is_active, TRUE) AS is_active
                     FROM banka_shop_backgrounds
-                    WHERE bg_uid = %s
-                      AND COALESCE(is_active, TRUE) = TRUE
-                      AND COALESCE(price_stars, 0) > 0
-                      AND (publish_at_ms IS NULL OR publish_at_ms <= %s)
-                      AND (expires_ms IS NULL OR expires_ms > %s)
-                      AND (max_qty IS NULL OR COALESCE(sold_count, 0) < max_qty)
+                    WHERE bg_uid = %s;
+                    """,
+                    (bg_uid,),
+                )
+                bg = cur.fetchone()
+                cur.execute(
+                    "SELECT 1 FROM banka_user_backgrounds WHERE owner_uid = %s AND bg_uid = %s;",
+                    (gdz_user["rec_uid"], bg_uid),
+                )
+                owned = cur.fetchone() is not None
+        if not bg or not bg["is_active"] or int(bg["price_stars"]) <= 0:
+            bot.answer_callback_query(call.id, "Фон недоступен", show_alert=True)
+            return
+        if owned:
+            bot.answer_callback_query(call.id, "Этот фон уже у вас в коллекции", show_alert=True)
+            return
+        if bg["publish_at_ms"] is not None and int(bg["publish_at_ms"]) > ts:
+            bot.answer_callback_query(call.id, "Фон ещё не вышел в продажу", show_alert=True)
+            return
+        if bg["is_limited"]:
+            if bg["expires_ms"] is not None and ts >= int(bg["expires_ms"]):
+                bot.answer_callback_query(call.id, "Срок продажи лимитного фона истёк", show_alert=True)
+                return
+            if bg["max_qty"] is not None and int(bg["max_qty"]) > 0 and int(bg["sold_count"]) >= int(bg["max_qty"]):
+                bot.answer_callback_query(call.id, "Тираж лимитного фона раскуплен", show_alert=True)
+                return
+        disc = max(0, min(99, int(bg["discount_pct"])))
+        eff_s = max(1, int(math.ceil(int(bg["price_stars"]) * (100 - disc) / 100.0))) if disc > 0 else int(bg["price_stars"])
+        bot.answer_callback_query(call.id)
+        order = create_order_for_tg_buyer(
+            gdz_user,
+            call.from_user.id,
+            "BACKGROUND",
+            target_bg_id=bg_uid,
+            stars_amount=eff_s,
+        )
+        send_stars_invoice_for_order(chat_id, order)
+        return
+
+    bot.answer_callback_query(call.id)
+
+
+@bot.message_handler(content_types=["text"])
+def handle_text(message: types.Message) -> None:
+    upsert_bot_user(message.from_user)
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    with state_lock:
+        st = user_states.get(uid)
+
+    if st and st.get("step") == "WAIT_LOGIN":
+        gdz_user = find_gdz_user_by_login(text)
+        if not gdz_user:
+            bot.send_message(
+                message.chat.id,
+                "Пользователь с таким логином в GDZgo не найден. Проверьте логин и попробуйте ещё раз:",
+            )
+            return
+        if gdz_user["ban_flag"]:
+            with state_lock:
+                user_states.pop(uid, None)
+            bot.send_message(message.chat.id, "⛔ Этот аккаунт заблокирован в GDZgo.")
+            return
+        with state_lock:
+            user_states.pop(uid, None)
+        upsert_bot_user(
+            message.from_user,
+            linked_uid=int(gdz_user["rec_uid"]),
+            linked_login=str(gdz_user["entry_tag"]),
+        )
+        send_shop_categories(message.chat.id, gdz_user)
+        return
+
+    if st and st.get("step") == "WAIT_COINS_STARS":
+        try:
+            s_amt = int(text)
+        except ValueError:
+            bot.send_message(message.chat.id, "Введите целое число звёзд ⭐, например: 25")
+            return
+        if s_amt <= 0 or s_amt > 100000:
+            bot.send_message(message.chat.id, "Укажите сумму от 1 до 100000 ⭐:")
+            return
+        with state_lock:
+            user_states.pop(uid, None)
+        gdz_user = get_linked_gdz_user(uid)
+        if not gdz_user:
+            bot.send_message(message.chat.id, "Сначала привяжите аккаунт GDZgo через /start")
+            return
+        pricing = get_runtime_pricing()
+        coins = max(1, int(s_amt * pricing["coins_per_star"] + 0.5))
+        order = create_order_for_tg_buyer(
+            gdz_user,
+            uid,
+            "COINS",
+            coins_amount=coins,
+            stars_amount=s_amt,
+        )
+        send_stars_invoice_for_order(message.chat.id, order)
+        return
+
+    # Если человек просто ввёл 6-символьный pay_code текстом
+    clean_code = text.upper()
+    if len(clean_code) == 6 and clean_code.isalnum():
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT o.order_uid, o.pay_code, o.buyer_uid, o.buyer_login,
+                           o.item_kind, o.plan_days, o.coins_amount, o.target_bg_id,
+                           o.stars_amount, o.status_tag,
+                           COALESCE(b.title_txt, '') AS bg_title
+                    FROM banka_stars_orders o
+                    LEFT JOIN banka_shop_backgrounds b ON b.bg_uid = o.target_bg_id
+                    WHERE UPPER(o.pay_code) = %s AND o.status_tag = 'PENDING'
                     LIMIT 1;
                     """,
-                    (bg_id, cur_ms, cur_ms),
+                    (clean_code,),
                 )
-                return cur.fetchone()
-
-        row = with_db(_fetch_bg)
-        if not row:
-            bot.answer_callback_query(call.id, "Фон больше недоступен для покупки", show_alert=True)
+                order = cur.fetchone()
+        if order:
+            upsert_bot_user(
+                message.from_user,
+                linked_uid=int(order["buyer_uid"]),
+                linked_login=str(order.get("buyer_login") or ""),
+            )
+            send_stars_invoice_for_order(message.chat.id, order)
             return
-        bot.answer_callback_query(call.id)
-        stars = discounted_stars(int(row[1]), int(row[2]))
-        oid, pcode = create_bot_stars_order(call.from_user.id, acc["id"], acc["login"], "BACKGROUND", 0, 0, bg_id, stars)
-        send_stars_invoice_for_order(
-            call.message.chat.id,
-            {"order_uid": oid, "pay_code": pcode, "buyer_uid": acc["id"], "buyer_login": acc["login"], "item_kind": "BACKGROUND", "plan_days": 0, "coins_amount": 0, "target_bg_id": bg_id, "stars_amount": stars, "bg_title": row[0]},
-        )
+
+    linked = get_linked_gdz_user(uid)
+    bot.send_message(
+        message.chat.id,
+        "Используйте кнопки меню или перейдите по кнопке оплаты в приложении GDZgo.",
+        reply_markup=main_menu_markup(str(linked["entry_tag"]) if linked else ""),
+    )
 
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
-def handle_pre_checkout(pre_checkout_query):
-    payload = pre_checkout_query.invoice_payload or ""
-    if not payload.startswith("gdz_order:"):
-        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Некорректный счёт.")
+def handle_pre_checkout(query: types.PreCheckoutQuery) -> None:
+    upsert_bot_user(query.from_user)
+    payload = (query.invoice_payload or "").strip()
+    if not payload.startswith("gdz_order:") or query.currency != "XTR":
+        bot.answer_pre_checkout_query(query.id, ok=False, error_message="Некорректный счёт.")
         return
     try:
-        _, oid_str, pcode = payload.split(":", 2)
-        oid = int(oid_str)
+        _, oid_str, code = payload.split(":", 2)
+        order_uid = int(oid_str)
     except Exception:
-        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Ошибка данных счёта.")
+        bot.answer_pre_checkout_query(query.id, ok=False, error_message="Некорректный код заказа.")
         return
 
-    def _check(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT status_tag, stars_amount, item_kind, target_bg_id, buyer_uid
-                FROM banka_stars_orders
-                WHERE order_uid = %s AND pay_code = %s
-                LIMIT 1;
-                """,
-                (oid, pcode),
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT order_uid, pay_code, stars_amount, status_tag
+                    FROM banka_stars_orders
+                    WHERE order_uid = %s;
+                    """,
+                    (order_uid,),
+                )
+                order = cur.fetchone()
+        if not order or str(order["pay_code"]).upper() != code.upper():
+            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Заказ не найден.")
+            return
+        if order["status_tag"] != "PENDING":
+            delete_uncleaned_invoices_for_order(order_uid)
+            bot.answer_pre_checkout_query(
+                query.id,
+                ok=False,
+                error_message="Оплата отменена или заказ уже закрыт. Деньги не списаны.",
             )
-            row = cur.fetchone()
-            if not row:
-                return False, "Заказ не найден."
-            status_tag, stars_amount, item_kind, target_bg_id, buyer_uid = row
-            if status_tag != "PENDING":
-                return False, "Этот счёт уже отменён или оплачен."
-            if int(stars_amount) != int(pre_checkout_query.total_amount):
-                return False, "Сумма заказа изменилась."
-            if str(item_kind).upper() == "BACKGROUND" and int(target_bg_id or 0) > 0:
-                if _table_exists(cur, "banka_user_backgrounds"):
-                    cur.execute(
-                        "SELECT 1 FROM banka_user_backgrounds WHERE owner_uid = %s AND bg_uid = %s LIMIT 1;",
-                        (int(buyer_uid), int(target_bg_id)),
-                    )
-                    if cur.fetchone():
-                        return False, "Этот фон уже есть в вашем профиле."
-                if _table_exists(cur, "banka_shop_backgrounds"):
-                    cur.execute(
-                        """
-                        SELECT 1 FROM banka_shop_backgrounds
-                        WHERE bg_uid = %s
-                          AND COALESCE(is_active, TRUE) = TRUE
-                          AND (publish_at_ms IS NULL OR publish_at_ms <= %s)
-                          AND (expires_ms IS NULL OR expires_ms > %s)
-                          AND (max_qty IS NULL OR COALESCE(sold_count, 0) < max_qty)
-                        LIMIT 1;
-                        """,
-                        (int(target_bg_id), now_ms(), now_ms()),
-                    )
-                    if not cur.fetchone():
-                        return False, "Товар распродан или скрыт."
-            return True, ""
-
-    ok, err_msg = with_db(_check)
-    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=ok, error_message=err_msg if not ok else None)
+            return
+        if int(order["stars_amount"]) != int(query.total_amount):
+            bot.answer_pre_checkout_query(
+                query.id,
+                ok=False,
+                error_message="Сумма заказа изменилась. Создайте новый счёт.",
+            )
+            return
+        bot.answer_pre_checkout_query(query.id, ok=True)
+    except Exception:
+        bot.answer_pre_checkout_query(
+            query.id,
+            ok=False,
+            error_message="Временная ошибка базы данных, повторите попытку.",
+        )
 
 
 @bot.message_handler(content_types=["successful_payment"])
-def handle_successful_payment(message):
+def handle_successful_payment(message: types.Message) -> None:
+    upsert_bot_user(message.from_user)
     sp = message.successful_payment
-    payload = sp.invoice_payload or ""
+    if not sp or not message.from_user:
+        return
+    tg_uid = message.from_user.id
     charge_id = sp.telegram_payment_charge_id
-    tg_id = int(message.from_user.id)
+    payload = (sp.invoice_payload or "").strip()
 
     try:
-        _, oid_str, pcode = payload.split(":", 2)
-        oid = int(oid_str)
+        _, oid_str, _ = payload.split(":", 2)
+        order_uid = int(oid_str)
     except Exception:
         return
 
-    cur_ms = now_ms()
+    need_refund = False
+    summary_text = ""
 
-    def _apply_payment(conn):
-        should_refund = False
-        already_done = False
-        summary_text = "✅ Оплата получена!"
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT order_uid, buyer_uid, buyer_login, item_kind, plan_days,
-                       coins_amount, target_bg_id, stars_amount, status_tag, telegram_charge_id
-                FROM banka_stars_orders
-                WHERE order_uid = %s AND pay_code = %s
-                FOR UPDATE;
-                """,
-                (oid, pcode),
-            )
-            row = cur.fetchone()
-            if not row:
-                should_refund = True
-            else:
-                _, buyer_uid, buyer_login, item_kind, plan_days, coins_amount, target_bg_id, stars_amount, status_tag, existing_charge = row
-                if existing_charge == charge_id and status_tag == "PAID":
-                    already_done = True
-                elif status_tag != "PENDING":
-                    should_refund = True
+    with db_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT order_uid, pay_code, buyer_uid, buyer_login,
+                           item_kind, plan_days, coins_amount, target_bg_id,
+                           stars_amount, status_tag, telegram_charge_id
+                    FROM banka_stars_orders
+                    WHERE order_uid = %s
+                    FOR UPDATE;
+                    """,
+                    (order_uid,),
+                )
+                order = cur.fetchone()
+                if not order:
+                    need_refund = True
+                elif order.get("telegram_charge_id") == charge_id:
+                    return
+                elif order["status_tag"] != "PENDING":
+                    need_refund = True
                 else:
+                    paid_ms = now_ms()
                     cur.execute(
                         """
                         UPDATE banka_stars_orders
@@ -1101,1993 +1151,1509 @@ def handle_successful_payment(message):
                             paid_ms = %s
                         WHERE order_uid = %s;
                         """,
-                        (tg_id, charge_id, cur_ms, oid),
+                        (tg_uid, charge_id, paid_ms, order_uid),
                     )
-                    kind = str(item_kind).upper()
-                    if kind == "PREMIUM":
-                        days = max(1, int(plan_days or 30))
-                        add_ms = days * 86_400_000
-                        cur.execute(
-                            "SELECT vip_flag, premium_until_ms, referred_by_uid FROM banka_profiles_vault WHERE rec_uid = %s FOR UPDATE;",
-                            (buyer_uid,),
-                        )
-                        u = cur.fetchone()
-                        if u:
-                            vip_flag, until_ms, ref_by = u
-                            if not (bool(vip_flag) and until_ms is None):
-                                base_ms = max(cur_ms, int(until_ms or 0))
-                                new_until = base_ms + add_ms
-                                cur.execute(
-                                    "UPDATE banka_profiles_vault SET vip_flag = TRUE, premium_until_ms = %s WHERE rec_uid = %s;",
-                                    (new_until, buyer_uid),
-                                )
-                            if ref_by and int(ref_by) > 0 and int(ref_by) != int(buyer_uid):
-                                cur.execute(
-                                    "UPDATE banka_profiles_vault SET vault_tokens = vault_tokens + %s WHERE rec_uid = %s;",
-                                    (REFERRAL_PREMIUM_BONUS_COINS, int(ref_by)),
-                                )
-                                cur.execute(
-                                    "UPDATE banka_profiles_vault SET referral_earned_coins = COALESCE(referral_earned_coins, 0) + %s WHERE rec_uid = %s;",
-                                    (REFERRAL_PREMIUM_BONUS_COINS, buyer_uid),
-                                )
-                                if _table_exists(cur, "banka_referral_ledger"):
-                                    cur.execute(
-                                        "INSERT INTO banka_referral_ledger (inviter_uid, referral_uid, reward_type, coins_delta, note_txt) VALUES (%s, %s, 'PREMIUM_BUY', %s, %s);",
-                                        (int(ref_by), buyer_uid, REFERRAL_PREMIUM_BONUS_COINS, f"Premium {days} дн. (Stars)"),
-                                    )
-                            if _table_exists(cur, "banka_user_notices"):
-                                cur.execute(
-                                    "INSERT INTO banka_user_notices (target_uid, kind_tag, title_txt, body_txt, reason_txt, issuer_label) VALUES (%s, 'PREMIUM_GRANTED', %s, %s, '', 'Telegram Stars');",
-                                    (buyer_uid, f"Активирован Premium ({days} дн.)", f"Оплачено ⭐ {stars_amount} Stars через Telegram-бота."),
-                                )
-                        summary_text = f"👑 Premium на {days} дн. успешно активирован для @{buyer_login}!"
-                    elif kind == "COINS":
-                        c_amt = max(1, int(coins_amount or 0))
+                    buyer_uid = int(order["buyer_uid"])
+                    stars_amt = int(order["stars_amount"])
+                    kind = str(order["item_kind"]).upper()
+
+                    if kind == "COINS":
+                        coins = max(1, int(order["coins_amount"]))
                         cur.execute(
                             "UPDATE banka_profiles_vault SET vault_tokens = vault_tokens + %s WHERE rec_uid = %s;",
-                            (c_amt, buyer_uid),
+                            (coins, buyer_uid),
                         )
-                        if _table_exists(cur, "banka_user_notices"):
-                            cur.execute(
-                                "INSERT INTO banka_user_notices (target_uid, kind_tag, title_txt, body_txt, reason_txt, issuer_label) VALUES (%s, 'COINS_GRANTED', %s, %s, '', 'Telegram Stars');",
-                                (buyer_uid, f"+{c_amt} монет", f"Зачислено за оплату ⭐ {stars_amount} Stars."),
-                            )
-                        summary_text = f"🪙 На баланс @{buyer_login} начислено +{c_amt} монет!"
+                        insert_user_notice(
+                            cur,
+                            buyer_uid,
+                            "COIN_PURCHASE_REWARD",
+                            f"+{coins} монет за ⭐ {stars_amt}!",
+                            f"Оплата через Telegram Stars выполнена. Начислено {coins} монет.",
+                        )
+                        summary_text = f"🪙 Начислено <b>+{coins} монет</b>!"
                     elif kind == "BACKGROUND":
-                        bg_id = int(target_bg_id or 0)
-                        if bg_id > 0:
-                            if _table_exists(cur, "banka_user_backgrounds"):
-                                cur.execute(
-                                    """
-                                    INSERT INTO banka_user_backgrounds (owner_uid, bg_uid, granted_via)
-                                    VALUES (%s, %s, 'STARS')
-                                    ON CONFLICT (owner_uid, bg_uid) DO NOTHING;
-                                    """,
-                                    (buyer_uid, bg_id),
-                                )
-                            if _table_exists(cur, "banka_shop_backgrounds"):
-                                cur.execute(
-                                    """
-                                    UPDATE banka_shop_backgrounds
-                                    SET sold_count = COALESCE(sold_count, 0) + 1,
-                                        earned_stars = COALESCE(earned_stars, 0) + %s
-                                    WHERE bg_uid = %s;
-                                    """,
-                                    (int(stars_amount), bg_id),
-                                )
-                            if _table_exists(cur, "banka_user_notices"):
-                                cur.execute(
-                                    "INSERT INTO banka_user_notices (target_uid, kind_tag, title_txt, body_txt, reason_txt, issuer_label) VALUES (%s, 'COINS_GRANTED', 'Новый фон профиля!', %s, '', 'Telegram Stars');",
-                                    (buyer_uid, f"Фон разблокирован за ⭐ {stars_amount} Stars."),
-                                )
-                        summary_text = f"🖼 Фон профиля открыт для @{buyer_login}!"
-        conn.commit()
-        return already_done, should_refund, summary_text
-
-    already_done, should_refund, summary_text = with_db(_apply_payment)
-    if already_done:
-        return
-
-    if should_refund:
-        try:
-            bot.refund_star_payment(tg_id, charge_id)
-            with_db(lambda conn: (conn.cursor().execute("UPDATE banka_stars_orders SET status_tag = 'REFUNDED' WHERE order_uid = %s;", (oid,)), conn.commit()))
-            bot.send_message(message.chat.id, "↩️ Заказ уже был отменён ранее — звёзды автоматически возвращены на ваш баланс Telegram.")
-        except Exception as e:
-            bot.send_message(message.chat.id, f"⚠️ Заказ был отменён. Ошибка автовозврата: {e}")
-        mark_invoices_cleaned(oid, except_delete=False)
-        return
-
-    mark_invoices_cleaned(oid, except_delete=False)
-    bot.send_message(message.chat.id, summary_text)
-
-
-def cancelled_invoice_watcher():
-    while True:
-        try:
-            if _db_initialized:
-                def _poll(conn):
-                    with conn.cursor() as cur:
+                        bg_uid = int(order["target_bg_id"])
+                        cur.execute(
+                            "SELECT title_txt FROM banka_shop_backgrounds WHERE bg_uid = %s FOR UPDATE;",
+                            (bg_uid,),
+                        )
+                        bg_row = cur.fetchone()
+                        bg_title = bg_row["title_txt"] if bg_row else f"Фон #{bg_uid}"
                         cur.execute(
                             """
-                            SELECT i.order_uid, i.chat_id, i.message_id
-                            FROM banka_stars_invoices i
-                            JOIN banka_stars_orders o ON o.order_uid = i.order_uid
-                            WHERE COALESCE(i.cleaned_flag, FALSE) = FALSE
-                              AND o.status_tag <> 'PENDING'
-                            LIMIT 25;
-                            """
+                            INSERT INTO banka_user_backgrounds (owner_uid, bg_uid, granted_via)
+                            VALUES (%s, %s, 'STARS')
+                            ON CONFLICT (owner_uid, bg_uid) DO NOTHING
+                            RETURNING bg_uid;
+                            """,
+                            (buyer_uid, bg_uid),
                         )
-                        return cur.fetchall()
+                        if cur.fetchone():
+                            cur.execute(
+                                """
+                                UPDATE banka_shop_backgrounds
+                                SET sold_count = COALESCE(sold_count, 0) + 1,
+                                    earned_stars = COALESCE(earned_stars, 0) + %s
+                                WHERE bg_uid = %s;
+                                """,
+                                (stars_amt, bg_uid),
+                            )
+                        insert_user_notice(
+                            cur,
+                            buyer_uid,
+                            "COIN_PURCHASE_REWARD",
+                            f"Фон «{bg_title}» куплен за ⭐ {stars_amt}!",
+                            f"Вы приобрели фон «{bg_title}» через Telegram Stars. Он уже доступен в коллекции.",
+                        )
+                        summary_text = f"🎨 Фон «<b>{html.escape(str(bg_title))}</b>» добавлен в вашу коллекцию!"
+                    else:
+                        days = max(1, int(order["plan_days"] or 30))
+                        grant_timed_premium_in_tx(cur, buyer_uid, days, stars_amt)
+                        summary_text = f"👑 Статус <b>Premium на {days} дн.</b> активирован!"
 
-                rows = with_db(_poll)
-                for oid, cid, mid in rows:
-                    try:
-                        bot.delete_message(int(cid), int(mid))
-                    except Exception:
-                        pass
-                    with_db(lambda conn: (
-                        conn.cursor().execute(
-                            "UPDATE banka_stars_invoices SET cleaned_flag = TRUE WHERE order_uid = %s AND chat_id = %s AND message_id = %s;",
-                            (int(oid), int(cid), int(mid)),
-                        ),
-                        conn.commit(),
-                    ))
+    if need_refund:
+        try:
+            bot.refund_star_payment(tg_uid, charge_id)
         except Exception:
             pass
-        time.sleep(2.5)
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Этот заказ уже был отменён ранее. Звёзды возвращены на ваш баланс Telegram.",
+        )
+        return
+
+    upsert_bot_user(
+        message.from_user,
+        linked_uid=int(order["buyer_uid"]),
+        linked_login=str(order.get("buyer_login") or ""),
+    )
+    delete_uncleaned_invoices_for_order(order_uid)
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Оплата прошла успешно!</b>\n{summary_text}\n"
+        f"Аккаунт GDZgo: <code>@{html.escape(str(order.get('buyer_login') or ''))}</code>",
+        parse_mode="HTML",
+        reply_markup=main_menu_markup(str(order.get("buyer_login") or "")),
+    )
 
 
-# ============================================================
-# HTML-ИНТЕРФЕЙСЫ (БЕЗОПАСНЫЙ DOM + АВТОПОВТОР ЗАПРОСОВ)
-# ============================================================
-PUBLIC_HTML = r"""<!DOCTYPE html>
+def cancelled_invoice_watcher() -> None:
+    while True:
+        try:
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT i.order_uid, i.chat_id, i.message_id, o.status_tag
+                        FROM banka_stars_invoices i
+                        JOIN banka_stars_orders o ON o.order_uid = i.order_uid
+                        WHERE COALESCE(i.cleaned_flag, FALSE) = FALSE AND o.status_tag <> 'PENDING'
+                        LIMIT 30;
+                        """
+                    )
+                    rows = cur.fetchall()
+                    for r in rows:
+                        try:
+                            bot.delete_message(int(r["chat_id"]), int(r["message_id"]))
+                        except Exception:
+                            pass
+                        cur.execute(
+                            """
+                            UPDATE banka_stars_invoices
+                            SET cleaned_flag = TRUE
+                            WHERE order_uid = %s AND chat_id = %s AND message_id = %s;
+                            """,
+                            (r["order_uid"], r["chat_id"], r["message_id"]),
+                        )
+        except Exception:
+            pass
+        time.sleep(2.0)
+
+
+# -----------------------------
+# Веб-портал & Админ-панель (/, /admin, /api/*)
+# -----------------------------
+def serialize_admin(row: dict[str, Any]) -> dict[str, Any]:
+    role = str(row.get("role") or ROLE_USER)
+    perms = {k: True for k in ALL_PERMISSIONS} if role == ROLE_SUPER_ADMIN else safe_json_dict(row.get("perms_json"))
+    return {
+        "web_uid": int(row["web_uid"]),
+        "login": str(row["login"]),
+        "display_name": str(row.get("display_name") or row["login"]),
+        "role": role,
+        "permissions": perms,
+        "created_ms": int(row.get("created_ms") or 0),
+        "last_login_ms": int(row.get("last_login_ms") or 0),
+    }
+
+
+def has_perm(user: dict[str, Any] | None, perm: str | None = None) -> bool:
+    if not user:
+        return False
+    role = user["role"]
+    if role == ROLE_SUPER_ADMIN:
+        return True
+    if role != ROLE_MODERATOR:
+        return False
+    if perm is None:
+        return True
+    return bool(user["permissions"].get(perm))
+
+
+HTML_PAGE = r"""<!doctype html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GDZgo Bot — Портал</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>GDZgo Bot — Портал и Админ-панель</title>
 <style>
-  :root { --bg:#0b0f17; --card:#131a26; --bd:#243044; --txt:#e8eef8; --muted:#93a4bd; --acc:#4f8cff; --ok:#22c55e; --err:#ef4444; }
-  * { box-sizing:border-box; }
-  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
-  .card { width:100%; max-width:420px; background:var(--card); border:1px solid var(--bd); border-radius:16px; padding:24px; box-shadow:0 20px 60px rgba(0,0,0,.45); }
-  h1 { margin:0 0 6px; font-size:22px; }
-  p.sub { margin:0 0 18px; color:var(--muted); font-size:14px; }
-  .tabs { display:flex; gap:8px; margin-bottom:16px; }
-  .tab { flex:1; padding:10px; border-radius:10px; border:1px solid var(--bd); background:transparent; color:var(--muted); cursor:pointer; font-weight:600; }
-  .tab.active { background:var(--acc); border-color:var(--acc); color:#fff; }
-  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 6px; }
-  input { width:100%; padding:11px 12px; border-radius:10px; border:1px solid var(--bd); background:#0c111b; color:var(--txt); font-size:15px; outline:none; }
-  input:focus { border-color:var(--acc); }
-  button.primary { width:100%; margin-top:16px; padding:12px; border-radius:10px; border:none; background:var(--acc); color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
-  .msg { margin-top:14px; padding:12px; border-radius:10px; font-size:14px; display:none; }
-  .msg.err { display:block; background:rgba(239,68,68,.15); border:1px solid rgba(239,68,68,.4); color:#fca5a5; }
-  .msg.ok { display:block; background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#86efac; }
-  .link-row { margin-top:14px; text-align:center; font-size:13px; color:var(--muted); }
-  a { color:var(--acc); text-decoration:none; }
+  :root {
+    --bg: #070b14;
+    --panel: rgba(17, 25, 42, 0.88);
+    --border: rgba(148, 163, 184, 0.18);
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --accent2: #818cf8;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --err: #fb7185;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(circle at 15% 10%, #102142 0%, var(--bg) 55%);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+  .topbar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 14px 18px; border-radius: 18px;
+    background: var(--panel); border: 1px solid var(--border); backdrop-filter: blur(12px);
+    margin-bottom: 18px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+  .pill {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    background: rgba(56,189,248,0.16); color: var(--accent); border: 1px solid rgba(56,189,248,0.35);
+  }
+  .pill.super { background: rgba(251,191,36,0.18); color: var(--warn); border-color: rgba(251,191,36,0.4); }
+  .pill.mod { background: rgba(129,140,248,0.2); color: #c7d2fe; border-color: rgba(129,140,248,0.4); }
+  .pill.user { background: rgba(251,113,133,0.16); color: var(--err); border-color: rgba(251,113,133,0.35); }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 18px;
+    padding: 18px; margin-bottom: 16px; backdrop-filter: blur(10px);
+  }
+  .auth-box { max-width: 430px; margin: 40px auto; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .tab {
+    padding: 9px 14px; border-radius: 12px; border: 1px solid var(--border);
+    background: rgba(15,23,42,0.7); color: var(--muted); cursor: pointer; font-weight: 600; font-size: 14px;
+  }
+  .tab.active {
+    background: linear-gradient(135deg, rgba(56,189,248,0.24), rgba(129,140,248,0.24));
+    color: #fff; border-color: rgba(56,189,248,0.5);
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+  .kpi {
+    padding: 15px; border-radius: 15px; background: rgba(15, 23, 42, 0.72);
+    border: 1px solid var(--border);
+  }
+  .kpi .lbl { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .kpi .val { font-size: 24px; font-weight: 800; color: #fff; }
+  .kpi .sub { color: var(--ok); font-size: 12px; margin-top: 4px; }
+  input, textarea, select {
+    width: 100%; padding: 10px 12px; border-radius: 11px;
+    border: 1px solid var(--border); background: rgba(8, 13, 25, 0.9);
+    color: var(--text); font-size: 14px; margin-top: 6px; margin-bottom: 12px;
+  }
+  textarea { min-height: 96px; resize: vertical; font-family: inherit; }
+  label { font-size: 13px; color: var(--muted); display: block; }
+  button {
+    padding: 10px 16px; border-radius: 11px; border: 0; cursor: pointer;
+    font-weight: 600; font-size: 14px; color: #04101d;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+  }
+  button.sec {
+    background: rgba(148,163,184,0.16); color: var(--text);
+    border: 1px solid var(--border);
+  }
+  button.danger { background: rgba(251,113,133,0.2); color: #fecdd3; border: 1px solid rgba(251,113,133,0.45); }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,0.12); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .table-wrap { overflow-x: auto; }
+  .msg { padding: 10px 12px; border-radius: 12px; margin-bottom: 12px; font-size: 13px; }
+  .msg.ok { background: rgba(52,211,153,0.15); border: 1px solid rgba(52,211,153,0.4); color: #a7f3d0; }
+  .msg.err { background: rgba(251,113,133,0.15); border: 1px solid rgba(251,113,133,0.4); color: #fecdd3; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .perm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px; margin-top: 8px; }
+  .perm-item {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    border-radius: 10px; background: rgba(15,23,42,0.7); border: 1px solid var(--border);
+    font-size: 12px; cursor: pointer;
+  }
+  .perm-item input { width: auto; margin: 0; }
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(3,7,18,0.75);
+    display: none; align-items: center; justify-content: center; padding: 16px; z-index: 50;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    width: 100%; max-width: 780px; max-height: 88vh; overflow-y: auto;
+    background: #0d1526; border: 1px solid var(--border); border-radius: 18px; padding: 20px;
+  }
+  .hide { display: none !important; }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>GDZgo Bot Portal</h1>
-  <p class="sub">Первый зарегистрированный аккаунт становится Супер-администратором (логин и пароль также можно обновить в приложении GDZgo в Спец.действиях).</p>
-  <div class="tabs">
-    <button class="tab active" id="tabLogin" type="button">Вход</button>
-    <button class="tab" id="tabReg" type="button">Регистрация</button>
-  </div>
-  <form id="authForm">
-    <label for="username">Логин</label>
-    <input id="username" autocomplete="username" required minlength="3" maxlength="50">
-    <label for="password">Пароль</label>
-    <input id="password" type="password" autocomplete="current-password" required minlength="4" maxlength="100">
-    <button class="primary" id="submitBtn" type="submit">Войти</button>
-  </form>
-  <div id="statusBox" class="msg"></div>
-  <div id="goAdminWrap" class="link-row" style="display:none;">
-    <a href="/admin">Открыть панель управления (/admin) →</a>
-  </div>
-</div>
-<script>
-let mode = "login";
-const tabLogin = document.getElementById("tabLogin");
-const tabReg = document.getElementById("tabReg");
-const submitBtn = document.getElementById("submitBtn");
-const statusBox = document.getElementById("statusBox");
-const goAdminWrap = document.getElementById("goAdminWrap");
-
-function setMode(m) {
-  mode = m;
-  tabLogin.classList.toggle("active", m === "login");
-  tabReg.classList.toggle("active", m === "register");
-  submitBtn.textContent = m === "login" ? "Войти" : "Зарегистрироваться";
-  statusBox.className = "msg";
-  statusBox.textContent = "";
-}
-tabLogin.onclick = () => setMode("login");
-tabReg.onclick = () => setMode("register");
-
-async function safePost(url, payload) {
-  for (let i = 0; i < 2; i++) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const txt = await res.text();
-      let data = {};
-      try { data = JSON.parse(txt); } catch (_) {}
-      if ((res.status === 502 || res.status === 503 || res.status === 504) && i === 0) {
-        await new Promise(r => setTimeout(r, 800));
-        continue;
-      }
-      return { ok: res.ok, status: res.status, data, raw: txt };
-    } catch (e) {
-      if (i === 0) {
-        await new Promise(r => setTimeout(r, 800));
-        continue;
-      }
-      throw e;
-    }
-  }
-}
-
-document.getElementById("authForm").onsubmit = async (e) => {
-  e.preventDefault();
-  statusBox.className = "msg";
-  statusBox.textContent = "Подождите...";
-  goAdminWrap.style.display = "none";
-  const u = document.getElementById("username").value.trim();
-  const p = document.getElementById("password").value;
-  try {
-    const r = await safePost(mode === "login" ? "/api/auth/login" : "/api/auth/register", { username: u, password: p });
-    if (!r.ok) {
-      statusBox.className = "msg err";
-      statusBox.textContent = r.data.error || ("Ошибка сервера HTTP " + r.status);
-      return;
-    }
-    if (r.data.role === "USER") {
-      statusBox.className = "msg err";
-      statusBox.textContent = "Вы не админ и не модератор. Обратитесь к супер-администратору для выдачи доступа.";
-      return;
-    }
-    statusBox.className = "msg ok";
-    statusBox.textContent = "Доступ подтверждён (" + r.data.role + "). Перейдите в /admin и войдите с этим аккаунтом.";
-    goAdminWrap.style.display = "block";
-  } catch (err) {
-    statusBox.className = "msg err";
-    statusBox.textContent = "Сервер не отвечает (" + (err.message || "таймаут") + "). Повторите через пару секунд.";
-  }
-};
-</script>
-</body>
-</html>
-"""
-
-ADMIN_HTML = r"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GDZgo Bot — /admin</title>
-<style>
-  :root { --bg:#0a0e16; --panel:#121926; --panel2:#182132; --bd:#243045; --txt:#ebf1fa; --muted:#93a4be; --acc:#4f8cff; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
-  * { box-sizing:border-box; }
-  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
-  .wrap { max-width:1280px; margin:0 auto; padding:18px; }
-  .topbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; background:var(--panel); border:1px solid var(--bd); border-radius:14px; padding:14px 18px; margin-bottom:16px; }
-  .brand { font-size:18px; font-weight:700; display:flex; align-items:center; gap:10px; }
-  .badge { font-size:12px; padding:3px 9px; border-radius:999px; background:rgba(79,140,255,.18); color:#8cb4ff; border:1px solid rgba(79,140,255,.35); }
-  .nav { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
-  .nav button { padding:9px 14px; border-radius:10px; border:1px solid var(--bd); background:var(--panel); color:var(--muted); cursor:pointer; font-weight:600; }
-  .nav button.active { background:var(--acc); border-color:var(--acc); color:#fff; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin-bottom:18px; }
-  .stat { background:var(--panel); border:1px solid var(--bd); border-radius:14px; padding:16px; }
-  .stat .lbl { font-size:13px; color:var(--muted); }
-  .stat .val { font-size:24px; font-weight:700; margin-top:6px; }
-  .card { background:var(--panel); border:1px solid var(--bd); border-radius:14px; padding:16px; margin-bottom:16px; }
-  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-  input, select, textarea { width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--bd); background:#0c111b; color:var(--txt); font-size:14px; outline:none; }
-  input:focus, textarea:focus, select:focus { border-color:var(--acc); }
-  button.btn { padding:9px 14px; border-radius:10px; border:1px solid var(--bd); background:var(--panel2); color:var(--txt); cursor:pointer; font-weight:600; font-size:13px; }
-  button.btn.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
-  button.btn.danger { background:rgba(239,68,68,.16); border-color:rgba(239,68,68,.4); color:#fca5a5; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--bd); vertical-align:top; }
-  th { color:var(--muted); font-weight:600; }
-  tr.click { cursor:pointer; }
-  tr.click:hover { background:rgba(79,140,255,.08); }
-  .login-wrap { max-width:410px; margin:70px auto; background:var(--panel); border:1px solid var(--bd); border-radius:16px; padding:24px; }
-  .msg { margin-top:12px; padding:10px 12px; border-radius:10px; font-size:13px; }
-  .msg.err { background:rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.4); color:#fca5a5; }
-  .msg.ok { background:rgba(34,197,94,.16); border:1px solid rgba(34,197,94,.4); color:#86efac; }
-  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.72); display:none; align-items:center; justify-content:center; padding:16px; z-index:50; }
-  .modal-bg.open { display:flex; }
-  .modal { width:100%; max-width:960px; max-height:90vh; overflow-y:auto; background:var(--panel); border:1px solid var(--bd); border-radius:16px; padding:20px; }
-  .chat-split { display:grid; grid-template-columns:290px 1fr; gap:12px; min-height:380px; }
-  @media (max-width: 760px) { .chat-split { grid-template-columns:1fr; } }
-  .chat-list { border:1px solid var(--bd); border-radius:12px; background:#0c111b; overflow-y:auto; max-height:460px; }
-  .chat-room-item { padding:10px 12px; border-bottom:1px solid var(--bd); cursor:pointer; }
-  .chat-room-item:hover, .chat-room-item.active { background:rgba(79,140,255,.15); }
-  .chat-feed { border:1px solid var(--bd); border-radius:12px; background:#0c111b; padding:12px; overflow-y:auto; max-height:460px; display:flex; flex-direction:column; gap:10px; }
-  .bubble { border:1px solid var(--bd); background:var(--panel2); border-radius:12px; padding:9px 12px; }
-  .bubble.deleted { opacity:.65; border-style:dashed; }
-  .bubble-meta { font-size:11px; color:var(--muted); margin-bottom:4px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; }
-  .bubble-quote { font-size:12px; color:#a5b4fc; border-left:2px solid var(--acc); padding-left:8px; margin-bottom:5px; }
-  .bubble-text { font-size:14px; white-space:pre-wrap; word-break:break-word; }
-  .preview-img { max-width:260px; max-height:200px; border-radius:10px; border:1px solid var(--bd); margin-top:8px; display:block; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; border:1px solid var(--bd); }
-  .pill.paid { color:#86efac; border-color:rgba(34,197,94,.45); background:rgba(34,197,94,.12); }
-  .pill.pending { color:#fde047; border-color:rgba(245,158,11,.45); background:rgba(245,158,11,.12); }
-  .pill.bad { color:#fca5a5; border-color:rgba(239,68,68,.45); background:rgba(239,68,68,.12); }
-</style>
-</head>
-<body>
-
-<div id="loginView" class="login-wrap">
-  <h2 style="margin:0 0 6px;">Вход в /admin</h2>
-  <p style="margin:0 0 14px;color:var(--muted);font-size:13px;">Авторизация администратора или модератора. Регистрация доступна на <a href="/" style="color:var(--acc);">главной странице</a>.</p>
-  <form id="adminLoginForm">
-    <label style="font-size:13px;color:var(--muted);display:block;margin:8px 0 4px;">Логин</label>
-    <input id="loginUser" autocomplete="username" required>
-    <label style="font-size:13px;color:var(--muted);display:block;margin:10px 0 4px;">Пароль</label>
-    <input id="loginPass" type="password" autocomplete="current-password" required>
-    <button class="btn primary" type="submit" style="width:100%;margin-top:14px;padding:11px;">Войти</button>
-  </form>
-  <div id="loginErr" class="msg err" style="display:none;"></div>
-</div>
-
-<div id="appView" class="wrap" style="display:none;">
+<div class="wrap">
   <div class="topbar">
     <div class="brand">
-      <span>⭐ GDZgo Admin</span>
-      <span id="meBadge" class="badge"></span>
+      <span>⭐ GDZgo Bot</span>
+      <span id="routeBadge" class="pill">Портал</span>
     </div>
-    <div class="row">
-      <button class="btn" id="refreshAllBtn" type="button">🔄 Обновить</button>
-      <button class="btn danger" id="logoutBtn" type="button">Выйти</button>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <a id="switchAdminLink" href="/admin" class="pill" style="text-decoration:none;">Перейти в /admin</a>
+      <span id="userBadge" class="pill hide"></span>
+      <button id="logoutBtn" class="sec hide" onclick="doLogout()">Выйти</button>
     </div>
   </div>
 
-  <div class="nav" id="mainNav"></div>
-  <div id="tabContent"></div>
+  <!-- AUTH VIEW -->
+  <div id="authCard" class="card auth-box hide">
+    <h2 id="authTitle" style="margin-top:0;">Вход</h2>
+    <p id="bootstrapHint" class="msg ok hide"></p>
+    <div class="tabs">
+      <button id="tabLogin" class="tab active" onclick="setAuthMode('login')">Вход</button>
+      <button id="tabReg" class="tab" onclick="setAuthMode('register')">Регистрация</button>
+    </div>
+    <div id="authMsg"></div>
+    <label>Логин</label>
+    <input id="authLogin" placeholder="например: admin" autocomplete="username" />
+    <div id="regNameWrap" class="hide">
+      <label>Имя (для отображения)</label>
+      <input id="authName" placeholder="Ваше имя" />
+    </div>
+    <label>Пароль</label>
+    <input id="authPass" type="password" placeholder="Минимум 6 символов" autocomplete="current-password" />
+    <button id="authSubmitBtn" style="width:100%;" onclick="submitAuth()">Войти</button>
+  </div>
+
+  <!-- NOT ADMIN / NOT MODERATOR -->
+  <div id="deniedCard" class="card auth-box hide" style="text-align:center;">
+    <h2 style="color:var(--err);margin-top:0;">Доступ ограничен</h2>
+    <p style="font-size:16px;font-weight:600;">Вы не админ и не модератор</p>
+    <p class="muted">Ваш аккаунт зарегистрирован в системе. Попросите Супер-Администратора выдать вам роль модератора и права доступа.</p>
+    <button class="sec" onclick="doLogout()">Выйти из аккаунта</button>
+  </div>
+
+  <!-- ADMIN / MODERATOR PANEL -->
+  <div id="panelView" class="hide">
+    <div id="navTabs" class="tabs"></div>
+    <div id="panelAlert"></div>
+
+    <div id="secStats" class="hide"></div>
+    <div id="secUsers" class="hide"></div>
+    <div id="secOrders" class="hide"></div>
+    <div id="secMessages" class="hide"></div>
+    <div id="secAdmins" class="hide"></div>
+  </div>
 </div>
 
-<div class="modal-bg" id="userModalBg">
+<!-- USER DETAIL MODAL -->
+<div id="userModalBg" class="modal-bg" onclick="if(event.target===this) closeModal()">
   <div class="modal">
-    <div class="row" style="justify-content:space-between;margin-bottom:12px;">
-      <div>
-        <h3 id="modalTitle" style="margin:0;">Профиль</h3>
-        <div id="modalSub" style="font-size:13px;color:var(--muted);margin-top:2px;"></div>
-      </div>
-      <button class="btn" id="closeModalBtn" type="button">✕ Закрыть</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 id="modalTitle" style="margin:0;">Профиль пользователя бота</h3>
+      <button class="sec" onclick="closeModal()">Закрыть</button>
     </div>
-    <div class="nav" id="modalTabs"></div>
     <div id="modalBody"></div>
   </div>
 </div>
 
 <script>
-let authToken = "";
-let meData = null;
-let currentTab = "dashboard";
-let broadcastPhotoDataUrl = "";
-let dmPhotoDataUrl = "";
+const PERM_LABELS = {
+  view_stats: "Доходы и аналитика",
+  view_users: "Пользователи и история ⭐",
+  view_orders: "Все заказы Stars",
+  send_dm: "Личные сообщения (ЛС)",
+  send_broadcast: "Массовая рассылка",
+  manage_orders: "Отмена PENDING-заказов"
+};
 
-function el(tag, attrs, children) {
-  const node = document.createElement(tag);
-  if (attrs) {
-    for (const [k, v] of Object.entries(attrs)) {
-      if (k === "class") node.className = v;
-      else if (k === "style") node.setAttribute("style", v);
-      else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2).toLowerCase(), v);
-      else if (v !== null && v !== undefined) node.setAttribute(k, String(v));
-    }
+let authToken = sessionStorage.getItem("gdz_bot_token") || "";
+let currentUser = null;
+let authMode = "login";
+let activeTab = "";
+let cachedUsers = [];
+const isAdminPath = window.location.pathname.startsWith("/admin");
+
+document.getElementById("routeBadge").textContent = isAdminPath ? "Админ-панель (/admin)" : "Портал пользователей (/)";
+if (isAdminPath) {
+  document.getElementById("switchAdminLink").href = "/";
+  document.getElementById("switchAdminLink").textContent = "На главную (/)";
+}
+
+function el(tag, text, cls) {
+  const n = document.createElement(tag);
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  if (cls) n.className = cls;
+  return n;
+}
+
+function showMsg(containerId, text, isErr) {
+  const box = document.getElementById(containerId);
+  box.innerHTML = "";
+  if (!text) return;
+  box.appendChild(el("div", text, "msg " + (isErr ? "err" : "ok")));
+}
+
+function fmtTime(ms) {
+  if (!ms) return "—";
+  const d = new Date(Number(ms) + 3 * 3600 * 1000);
+  const pad = n => String(n).padStart(2, "0");
+  return `${pad(d.getUTCDate())}.${pad(d.getUTCMonth()+1)}.${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} МСК`;
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (authToken) headers["Authorization"] = "Bearer " + authToken;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) throw new Error(data.error || ("Ошибка HTTP " + res.status));
+  return data;
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  document.getElementById("tabLogin").classList.toggle("active", mode === "login");
+  document.getElementById("tabReg").classList.toggle("active", mode === "register");
+  document.getElementById("regNameWrap").classList.toggle("hide", mode !== "register");
+  document.getElementById("authTitle").textContent = mode === "register" ? "Регистрация аккаунта" : (isAdminPath ? "Вход в админ-панель" : "Вход в систему");
+  document.getElementById("authSubmitBtn").textContent = mode === "register" ? "Зарегистрироваться" : "Войти";
+  showMsg("authMsg", "", false);
+}
+
+async function submitAuth() {
+  const login = document.getElementById("authLogin").value.trim();
+  const password = document.getElementById("authPass").value;
+  const display_name = document.getElementById("authName").value.trim();
+  try {
+    const ep = authMode === "register" ? "/api/auth/register" : "/api/auth/login";
+    const data = await api(ep, {
+      method: "POST",
+      body: JSON.stringify({ login, password, display_name })
+    });
+    authToken = data.token;
+    sessionStorage.setItem("gdz_bot_token", authToken);
+    currentUser = data.user;
+    renderApp();
+  } catch (e) {
+    showMsg("authMsg", e.message, true);
   }
-  if (children !== undefined && children !== null) {
-    const arr = Array.isArray(children) ? children : [children];
-    for (const c of arr) {
-      if (c === null || c === undefined) continue;
-      if (typeof c === "string" || typeof c === "number") node.appendChild(document.createTextNode(String(c)));
-      else node.appendChild(c);
-    }
-  }
-  return node;
+}
+
+async function doLogout() {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch (_) {}
+  authToken = "";
+  currentUser = null;
+  sessionStorage.removeItem("gdz_bot_token");
+  await bootstrap();
 }
 
 function hasPerm(perm) {
-  if (!meData) return false;
-  if (meData.role === "SUPER_ADMIN") return true;
-  return meData.role === "MODERATOR" && Array.isArray(meData.permissions) && meData.permissions.includes(perm);
+  if (!currentUser) return false;
+  if (currentUser.role === "SUPER_ADMIN") return true;
+  if (currentUser.role !== "MODERATOR") return false;
+  return !!(currentUser.permissions && currentUser.permissions[perm]);
 }
 
-async function apiFetch(url, opts = {}) {
-  const headers = Object.assign({}, opts.headers || {});
-  if (authToken) headers["Authorization"] = "Bearer " + authToken;
-  if (opts.body && !(opts.body instanceof FormData) && !headers["Content-Type"]) {
-    headers["Content-Type"] = "application/json";
+async function bootstrap() {
+  let st = { has_super_admin: true };
+  try { st = await api("/api/auth/status"); } catch (_) {}
+  const hint = document.getElementById("bootstrapHint");
+  if (!st.has_super_admin) {
+    hint.textContent = "База администраторов пуста: первый зарегистрированный аккаунт станет Супер-Администратором!";
+    hint.classList.remove("hide");
+    if (!isAdminPath) setAuthMode("register");
+  } else {
+    hint.classList.add("hide");
   }
-  for (let attempt = 0; attempt < 2; attempt++) {
+
+  if (authToken) {
     try {
-      const res = await fetch(url, Object.assign({}, opts, { headers }));
-      const txt = await res.text();
-      let data = {};
-      try { data = JSON.parse(txt); } catch (_) {}
-      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt === 0) {
-        await new Promise(r => setTimeout(r, 700));
-        continue;
-      }
-      if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
-      return data;
-    } catch (e) {
-      if (attempt === 0 && (e instanceof TypeError)) {
-        await new Promise(r => setTimeout(r, 700));
-        continue;
-      }
-      throw e;
+      const me = await api("/api/auth/me");
+      currentUser = me.user;
+    } catch (_) {
+      authToken = "";
+      currentUser = null;
+      sessionStorage.removeItem("gdz_bot_token");
     }
   }
+  renderApp();
 }
 
-function readImageFile(fileInput, maxBytes, onOk, onErr) {
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) { onOk(""); return; }
-  const allowed = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-  if (!allowed.includes(file.type)) { onErr("Допустимы только PNG, JPEG, WEBP или GIF"); return; }
-  if (file.size > maxBytes) { onErr("Размер фото больше 5.5 МБ"); return; }
-  const reader = new FileReader();
-  reader.onload = () => onOk(typeof reader.result === "string" ? reader.result : "");
-  reader.onerror = () => onErr("Не удалось прочитать файл");
-  reader.readAsDataURL(file);
-}
+function renderApp() {
+  const authCard = document.getElementById("authCard");
+  const deniedCard = document.getElementById("deniedCard");
+  const panelView = document.getElementById("panelView");
+  const badge = document.getElementById("userBadge");
+  const logoutBtn = document.getElementById("logoutBtn");
 
-function isSafeImageDataUrl(val) {
-  if (typeof val !== "string" || !val) return false;
-  return /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\r\n]+$/i.test(val.trim());
-}
+  authCard.classList.add("hide");
+  deniedCard.classList.add("hide");
+  panelView.classList.add("hide");
+  badge.classList.add("hide");
+  logoutBtn.classList.add("hide");
 
-function isSafeRawBase64(val) {
-  if (typeof val !== "string" || !val) return false;
-  return /^[A-Za-z0-9+/=\r\n]+$/.test(val.trim());
-}
-
-document.getElementById("adminLoginForm").onsubmit = async (e) => {
-  e.preventDefault();
-  const errBox = document.getElementById("loginErr");
-  errBox.style.display = "none";
-  try {
-    const data = await apiFetch("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({
-        username: document.getElementById("loginUser").value.trim(),
-        password: document.getElementById("loginPass").value
-      })
-    });
-    if (data.role === "USER") {
-      errBox.textContent = "Вы не админ и не модератор";
-      errBox.style.display = "block";
-      return;
-    }
-    authToken = data.token;
-    meData = data;
-    document.getElementById("loginView").style.display = "none";
-    document.getElementById("appView").style.display = "block";
-    document.getElementById("meBadge").textContent = meData.username + " (" + meData.role + ")";
-    renderNav();
-    loadActiveTab();
-  } catch (err) {
-    errBox.textContent = err.message || "Ошибка подключения к серверу";
-    errBox.style.display = "block";
-  }
-};
-
-document.getElementById("logoutBtn").onclick = async () => {
-  try { await apiFetch("/api/auth/logout", { method: "POST" }); } catch (_) {}
-  authToken = "";
-  meData = null;
-  document.getElementById("appView").style.display = "none";
-  document.getElementById("loginView").style.display = "block";
-};
-
-document.getElementById("refreshAllBtn").onclick = () => loadActiveTab();
-document.getElementById("closeModalBtn").onclick = () => document.getElementById("userModalBg").classList.remove("open");
-
-function renderNav() {
-  const nav = document.getElementById("mainNav");
-  nav.textContent = "";
-  const tabs = [];
-  if (hasPerm("view_dashboard")) tabs.push(["dashboard", "📊 Статистика"]);
-  if (hasPerm("view_users")) tabs.push(["bot_users", "🤖 Пользователи бота"]);
-  if (hasPerm("view_users") || hasPerm("view_chats")) tabs.push(["gdz_users", "🎓 Все аккаунты GDZgo"]);
-  if (hasPerm("broadcast")) tabs.push(["broadcast", "📢 Рассылка"]);
-  if (meData && meData.role === "SUPER_ADMIN") tabs.push(["moderators", "🛡️ Модераторы"]);
-
-  if (tabs.length === 0) {
-    document.getElementById("tabContent").textContent = "У вашей роли нет доступных разделов.";
+  if (!currentUser) {
+    authCard.classList.remove("hide");
     return;
   }
-  if (!tabs.some(t => t[0] === currentTab)) currentTab = tabs[0][0];
 
-  for (const [id, label] of tabs) {
-    const b = el("button", { class: id === currentTab ? "active" : "", type: "button" }, label);
-    b.onclick = () => { currentTab = id; renderNav(); loadActiveTab(); };
+  badge.classList.remove("hide");
+  logoutBtn.classList.remove("hide");
+  badge.textContent = `${currentUser.display_name} (@${currentUser.login}) · ${currentUser.role}`;
+  badge.className = "pill " + (
+    currentUser.role === "SUPER_ADMIN" ? "super" :
+    currentUser.role === "MODERATOR" ? "mod" : "user"
+  );
+
+  if (currentUser.role !== "SUPER_ADMIN" && currentUser.role !== "MODERATOR") {
+    deniedCard.classList.remove("hide");
+    return;
+  }
+
+  panelView.classList.remove("hide");
+  buildTabs();
+}
+
+function buildTabs() {
+  const tabs = [];
+  if (hasPerm("view_stats")) tabs.push({ id: "stats", label: "📊 Доходы и обзор" });
+  if (hasPerm("view_users")) tabs.push({ id: "users", label: "👥 Пользователи бота" });
+  if (hasPerm("view_orders")) tabs.push({ id: "orders", label: "🧾 Заказы Stars" });
+  if (hasPerm("send_dm") || hasPerm("send_broadcast")) tabs.push({ id: "messages", label: "✉️ Сообщения и рассылка" });
+  if (currentUser.role === "SUPER_ADMIN") tabs.push({ id: "admins", label: "🛡 Модераторы и права" });
+
+  const nav = document.getElementById("navTabs");
+  nav.innerHTML = "";
+  if (!tabs.length) {
+    showMsg("panelAlert", "У вас роль Модератор, но пока не включено ни одно право. Обратитесь к Супер-Админу.", true);
+    return;
+  }
+  showMsg("panelAlert", "", false);
+
+  if (!tabs.some(t => t.id === activeTab)) activeTab = tabs[0].id;
+  for (const t of tabs) {
+    const b = el("button", t.label, "tab" + (t.id === activeTab ? " active" : ""));
+    b.onclick = () => { activeTab = t.id; buildTabs(); };
     nav.appendChild(b);
   }
+  loadActiveTab();
+}
+
+function hideAllSections() {
+  ["secStats", "secUsers", "secOrders", "secMessages", "secAdmins"].forEach(id => {
+    document.getElementById(id).classList.add("hide");
+  });
 }
 
 async function loadActiveTab() {
-  const root = document.getElementById("tabContent");
-  root.textContent = "Загрузка...";
+  hideAllSections();
   try {
-    if (currentTab === "dashboard") await renderDashboard(root);
-    else if (currentTab === "bot_users") await renderBotUsers(root);
-    else if (currentTab === "gdz_users") await renderGdzUsers(root);
-    else if (currentTab === "broadcast") await renderBroadcast(root);
-    else if (currentTab === "moderators") await renderModerators(root);
-  } catch (err) {
-    root.textContent = "";
-    root.appendChild(el("div", { class: "msg err" }, "Ошибка: " + err.message));
+    if (activeTab === "stats") await renderStats();
+    else if (activeTab === "users") await renderUsers();
+    else if (activeTab === "orders") await renderOrders();
+    else if (activeTab === "messages") await renderMessages();
+    else if (activeTab === "admins") await renderAdmins();
+  } catch (e) {
+    showMsg("panelAlert", e.message, true);
   }
 }
 
-async function renderDashboard(root) {
-  const d = await apiFetch("/api/dashboard");
-  root.textContent = "";
-  const grid = el("div", { class: "grid" }, [
-    statCard("Доход сегодня (МСК)", "⭐ " + d.stars_today + " (" + d.orders_today + " шт.)"),
-    statCard("Доход за 7 дней", "⭐ " + d.stars_week + " (" + d.orders_week + " шт.)"),
-    statCard("Доход за 30 дней", "⭐ " + d.stars_month + " (" + d.orders_month + " шт.)"),
-    statCard("Доход за всё время", "⭐ " + d.stars_all + " (" + d.orders_all + " шт.)"),
-    statCard("Пользователей бота", String(d.bot_users_count)),
-    statCard("Аккаунтов GDZgo", String(d.gdz_users_count)),
-    statCard("Чатов / сообщений", d.chat_rooms_count + " / " + d.chat_messages_count),
-    statCard("Ожидают / Отменены", d.pending_orders + " / " + d.cancelled_orders)
-  ]);
-  root.appendChild(grid);
+async function renderStats() {
+  const box = document.getElementById("secStats");
+  box.classList.remove("hide");
+  box.innerHTML = "<div class='card'>Загрузка аналитики...</div>";
+  const d = await api("/api/stats");
+  box.innerHTML = "";
 
-  const card = el("div", { class: "card" });
-  card.appendChild(el("h3", { style: "margin:0 0 12px;" }, "Последние оплаты Telegram Stars"));
+  const kpiCard = el("div", null, "card");
+  kpiCard.appendChild(el("h3", "Доходы в Telegram Stars ⭐ и завершённые сделки", null));
+  const grid = el("div", null, "grid");
+  const blocks = [
+    ["Сегодня (МСК)", `⭐ ${d.day.stars}`, `Сделок: ${d.day.deals}`],
+    ["За неделю (7 дн.)", `⭐ ${d.week.stars}`, `Сделок: ${d.week.deals}`],
+    ["За месяц (30 дн.)", `⭐ ${d.month.stars}`, `Сделок: ${d.month.deals}`],
+    ["За всё время", `⭐ ${d.all.stars}`, `Завершено сделок: ${d.all.deals}`],
+    ["Пользователей бота", `${d.bot_users_count}`, `Оплативших: ${d.paying_users_count}`],
+    ["Активные / Отменённые", `${d.pending_count} / ${d.cancelled_count}`, `В ожидании / Отменено`],
+  ];
+  for (const [lbl, val, sub] of blocks) {
+    const k = el("div", null, "kpi");
+    k.appendChild(el("div", lbl, "lbl"));
+    k.appendChild(el("div", val, "val"));
+    k.appendChild(el("div", sub, "sub"));
+    grid.appendChild(k);
+  }
+  kpiCard.appendChild(grid);
+  box.appendChild(kpiCard);
+
+  const brCard = el("div", null, "card");
+  brCard.appendChild(el("h3", "Разбивка доходов по типам покупок", null));
+  const tw = el("div", null, "table-wrap");
   const tbl = el("table");
-  tbl.appendChild(el("thead", null, el("tr", null, [
-    el("th", null, "Время (МСК)"), el("th", null, "GDZgo логин"), el("th", null, "Товар"), el("th", null, "Звёзды"), el("th", null, "Статус")
-  ])));
+  tbl.innerHTML = "<thead><tr><th>Категория</th><th>Завершено сделок</th><th>Заработано ⭐</th></tr></thead>";
   const tb = el("tbody");
-  for (const o of (d.recent_orders || [])) {
-    const tr = el("tr", { class: "click" }, [
-      el("td", null, o.created_msk),
-      el("td", null, o.buyer_login || ("UID #" + o.buyer_uid)),
-      el("td", null, o.item_label),
-      el("td", null, "⭐ " + o.stars_amount),
-      el("td", null, statusPill(o.status_tag))
-    ]);
-    tr.onclick = () => openUserModal({ tg_user_id: o.telegram_user_id || 0, gdz_user_id: o.buyer_uid, title: o.buyer_login || ("UID #" + o.buyer_uid) });
+  for (const row of (d.by_kind || [])) {
+    const tr = el("tr");
+    tr.appendChild(el("td", row.kind_label));
+    tr.appendChild(el("td", row.deals));
+    tr.appendChild(el("td", "⭐ " + row.stars));
     tb.appendChild(tr);
   }
   tbl.appendChild(tb);
-  card.appendChild(tbl);
-  root.appendChild(card);
+  tw.appendChild(tbl);
+  brCard.appendChild(tw);
+  box.appendChild(brCard);
 }
 
-function statCard(lbl, val) {
-  return el("div", { class: "stat" }, [
-    el("div", { class: "lbl" }, lbl),
-    el("div", { class: "val" }, val)
-  ]);
-}
+async function renderUsers() {
+  const box = document.getElementById("secUsers");
+  box.classList.remove("hide");
+  box.innerHTML = "<div class='card'>Загрузка пользователей бота...</div>";
+  const d = await api("/api/users");
+  cachedUsers = d.users || [];
+  box.innerHTML = "";
 
-function statusPill(st) {
-  const s = String(st || "");
-  const cls = s === "PAID" ? "pill paid" : (s === "PENDING" ? "pill pending" : "pill bad");
-  return el("span", { class: cls }, s);
-}
+  const card = el("div", null, "card");
+  card.appendChild(el("h3", `Пользователи бота (${cachedUsers.length})`, null));
+  const search = el("input");
+  search.placeholder = "Поиск по нику в GDZgo, Telegram @username, имени или TG ID...";
+  card.appendChild(search);
 
-async function renderBotUsers(root, query = "") {
-  const data = await apiFetch("/api/users" + (query ? ("?q=" + encodeURIComponent(query)) : ""));
-  root.textContent = "";
-  const searchRow = el("div", { class: "card row" });
-  const inp = el("input", { placeholder: "Поиск по @username, имени, Telegram ID или логину GDZgo...", value: query, style: "flex:1;min-width:220px;" });
-  const btn = el("button", { class: "btn primary", type: "button" }, "Найти");
-  btn.onclick = () => renderBotUsers(root, inp.value.trim());
-  inp.onkeydown = (e) => { if (e.key === "Enter") renderBotUsers(root, inp.value.trim()); };
-  searchRow.appendChild(inp);
-  searchRow.appendChild(btn);
-  root.appendChild(searchRow);
-
-  const card = el("div", { class: "card" });
-  card.appendChild(el("div", { style: "color:var(--muted);font-size:13px;margin-bottom:10px;" }, "Кликните по строке пользователя, чтобы открыть его профиль, чаты GDZgo и покупки Stars."));
+  const tw = el("div", null, "table-wrap");
   const tbl = el("table");
-  tbl.appendChild(el("thead", null, el("tr", null, [
-    el("th", null, "Telegram"), el("th", null, "Аккаунт GDZgo"), el("th", null, "Потрачено ⭐"), el("th", null, "Покупок"), el("th", null, "Активность (МСК)")
-  ])));
+  tbl.innerHTML = "<thead><tr><th>Telegram</th><th>Аккаунт GDZgo</th><th>Потрачено ⭐</th><th>Сделок</th><th>Последний визит</th><th>Действия</th></tr></thead>";
   const tb = el("tbody");
-  for (const u of (data.users || [])) {
-    const tgTitle = [u.tg_first_name, u.tg_last_name].filter(Boolean).join(" ") || ("TG #" + u.tg_user_id);
-    const gdzLabel = u.gdz_user_id > 0 ? ((u.gdz_fullname || u.gdz_login || ("#" + u.gdz_user_id)) + " (@" + u.gdz_login + ")") : "Не привязан";
-    const tr = el("tr", { class: "click" }, [
-      el("td", null, tgTitle + (u.tg_username ? " (@" + u.tg_username + ")" : "") + " [" + u.tg_user_id + "]"),
-      el("td", null, gdzLabel),
-      el("td", null, "⭐ " + u.spent_stars),
-      el("td", null, String(u.paid_orders_count)),
-      el("td", null, u.last_seen_msk)
-    ]);
-    tr.onclick = () => openUserModal({
-      tg_user_id: u.tg_user_id,
-      gdz_user_id: u.gdz_user_id,
-      title: tgTitle,
-      subtitle: "TG @" + (u.tg_username || "—") + " • GDZgo: " + gdzLabel
-    });
-    tb.appendChild(tr);
-  }
-  tbl.appendChild(tb);
-  card.appendChild(tbl);
-  root.appendChild(card);
-}
 
-async function renderGdzUsers(root, query = "") {
-  const data = await apiFetch("/api/gdz-users" + (query ? ("?q=" + encodeURIComponent(query)) : ""));
-  root.textContent = "";
-  const searchRow = el("div", { class: "card row" });
-  const inp = el("input", { placeholder: "Поиск по логину, ФИО, ID или классу GDZgo...", value: query, style: "flex:1;min-width:220px;" });
-  const btn = el("button", { class: "btn primary", type: "button" }, "Найти");
-  btn.onclick = () => renderGdzUsers(root, inp.value.trim());
-  inp.onkeydown = (e) => { if (e.key === "Enter") renderGdzUsers(root, inp.value.trim()); };
-  searchRow.appendChild(inp);
-  searchRow.appendChild(btn);
-  root.appendChild(searchRow);
+  function drawRows(q) {
+    tb.innerHTML = "";
+    const needle = (q || "").trim().toLowerCase();
+    for (const u of cachedUsers) {
+      const hay = `${u.tg_user_id} ${u.tg_username} ${u.first_name} ${u.last_name} ${u.gdz_login} ${u.gdz_full_name}`.toLowerCase();
+      if (needle && !hay.includes(needle)) continue;
+      const tr = el("tr");
+      const tgName = [u.first_name, u.last_name].filter(Boolean).join(" ") || "Без имени";
+      const tgTd = el("td");
+      tgTd.appendChild(el("div", tgName));
+      tgTd.appendChild(el("div", (u.tg_username ? "@" + u.tg_username : "без @") + " · ID " + u.tg_user_id, "muted"));
 
-  const card = el("div", { class: "card" });
-  card.appendChild(el("div", { style: "color:var(--muted);font-size:13px;margin-bottom:10px;" }, "Все аккаунты приложения GDZgo — нажмите на любой профиль для просмотра переписок и покупок."));
-  const tbl = el("table");
-  tbl.appendChild(el("thead", null, el("tr", null, [
-    el("th", null, "ID / Логин"), el("th", null, "Имя"), el("th", null, "Роль / VIP"), el("th", null, "Чатов"), el("th", null, "Потрачено ⭐")
-  ])));
-  const tb = el("tbody");
-  for (const u of (data.users || [])) {
-    const tr = el("tr", { class: "click" }, [
-      el("td", null, "#" + u.rec_uid + " @" + u.login),
-      el("td", null, (u.full_name || u.login) + (u.cohort_code ? (" (" + u.cohort_code + ")") : "")),
-      el("td", null, u.rank_badge + (u.is_vip ? " • 👑 VIP" : "")),
-      el("td", null, String(u.chats_count)),
-      el("td", null, "⭐ " + u.spent_stars)
-    ]);
-    tr.onclick = () => openUserModal({
-      tg_user_id: u.tg_user_id || 0,
-      gdz_user_id: u.rec_uid,
-      title: (u.full_name || u.login) + " (@" + u.login + ")",
-      subtitle: "GDZgo ID #" + u.rec_uid + " • Монеты: " + u.coins + (u.tg_user_id ? (" • TG #" + u.tg_user_id) : " • TG не привязан")
-    });
-    tb.appendChild(tr);
-  }
-  tbl.appendChild(tb);
-  card.appendChild(tbl);
-  root.appendChild(card);
-}
+      const gdzTd = el("td");
+      gdzTd.appendChild(el("div", u.gdz_login ? ("@" + u.gdz_login) : "Не привязан"));
+      if (u.gdz_full_name || u.gdz_class) {
+        gdzTd.appendChild(el("div", `${u.gdz_full_name || ""} ${u.gdz_class ? "(" + u.gdz_class + ")" : ""}`.trim(), "muted"));
+      }
 
-async function openUserModal(info) {
-  const bg = document.getElementById("userModalBg");
-  document.getElementById("modalTitle").textContent = info.title || "Профиль";
-  document.getElementById("modalSub").textContent = info.subtitle || ("GDZgo #" + (info.gdz_user_id || 0) + " • TG #" + (info.tg_user_id || 0));
-  bg.classList.add("open");
+      tr.appendChild(tgTd);
+      tr.appendChild(gdzTd);
+      tr.appendChild(el("td", "⭐ " + u.total_stars_spent));
+      tr.appendChild(el("td", u.paid_orders_count));
+      tr.appendChild(el("td", fmtTime(u.last_seen_ms)));
 
-  const tabsEl = document.getElementById("modalTabs");
-  const bodyEl = document.getElementById("modalBody");
-  let active = hasPerm("view_chats") ? "chats" : (hasPerm("view_users") ? "orders" : "dm");
-
-  function drawModalTabs() {
-    tabsEl.textContent = "";
-    const list = [];
-    if (hasPerm("view_chats")) list.push(["chats", "💬 Чаты и переписки GDZgo"]);
-    if (hasPerm("view_users")) list.push(["orders", "⭐ Покупки Stars"]);
-    if (hasPerm("send_dm") && info.tg_user_id > 0) list.push(["dm", "✉️ Написать в бота (ЛС)"]);
-    for (const [id, lbl] of list) {
-      const b = el("button", { class: id === active ? "active" : "", type: "button" }, lbl);
-      b.onclick = () => { active = id; drawModalTabs(); loadModalTab(); };
-      tabsEl.appendChild(b);
+      const act = el("td", null, "row-actions");
+      const btnHist = el("button", "История ⭐", "sec");
+      btnHist.onclick = () => openUserModal(u);
+      act.appendChild(btnHist);
+      if (hasPerm("send_dm")) {
+        const btnDm = el("button", "Написать");
+        btnDm.onclick = () => jumpToDm(u.tg_user_id);
+        act.appendChild(btnDm);
+      }
+      tr.appendChild(act);
+      tb.appendChild(tr);
     }
   }
 
-  async function loadModalTab() {
-    bodyEl.textContent = "Загрузка...";
-    try {
-      if (active === "chats") await renderUserChatsTab(bodyEl, info);
-      else if (active === "orders") await renderUserOrdersTab(bodyEl, info);
-      else if (active === "dm") await renderUserDmTab(bodyEl, info);
-    } catch (err) {
-      bodyEl.textContent = "";
-      bodyEl.appendChild(el("div", { class: "msg err" }, err.message));
-    }
-  }
-
-  drawModalTabs();
-  loadModalTab();
+  search.oninput = () => drawRows(search.value);
+  drawRows("");
+  tbl.appendChild(tb);
+  tw.appendChild(tbl);
+  card.appendChild(tw);
+  box.appendChild(card);
 }
 
-async function renderUserChatsTab(container, info) {
-  let res;
-  if (info.gdz_user_id > 0) {
-    res = await apiFetch("/api/gdz-users/" + info.gdz_user_id + "/chats");
-  } else if (info.tg_user_id > 0) {
-    res = await apiFetch("/api/users/" + info.tg_user_id + "/chats");
-  } else {
-    container.textContent = "У пользователя нет привязанного аккаунта GDZgo.";
-    return;
-  }
-  const rooms = res.rooms || [];
-  container.textContent = "";
-  if (rooms.length === 0) {
-    container.appendChild(el("div", { class: "card" }, "У этого пользователя ещё нет чатов в GDZgo."));
-    return;
-  }
-
-  const split = el("div", { class: "chat-split" });
-  const listEl = el("div", { class: "chat-list" });
-  const feedEl = el("div", { class: "chat-feed" }, "Выберите чат слева, чтобы загрузить переписку.");
-
-  rooms.forEach((r, idx) => {
-    const item = el("div", { class: "chat-room-item" + (idx === 0 ? " active" : "") }, [
-      el("div", { style: "font-weight:600;font-size:14px;" }, r.display_title),
-      el("div", { style: "font-size:12px;color:var(--muted);margin-top:3px;" }, r.kind_tag + " • Сообщений: " + r.messages_count + " • " + r.updated_msk)
-    ]);
-    item.onclick = () => {
-      for (const ch of listEl.children) ch.classList.remove("active");
-      item.classList.add("active");
-      loadRoomTranscript(feedEl, r.room_uid);
-    };
-    listEl.appendChild(item);
-  });
-
-  split.appendChild(listEl);
-  split.appendChild(feedEl);
-  container.appendChild(split);
-  loadRoomTranscript(feedEl, rooms[0].room_uid);
-}
-
-async function loadRoomTranscript(feedEl, roomUid) {
-  feedEl.textContent = "Загрузка сообщений...";
+async function openUserModal(u) {
+  document.getElementById("userModalBg").classList.add("open");
+  document.getElementById("modalTitle").textContent = `Пользователь: ${u.tg_username ? "@" + u.tg_username : u.tg_user_id}`;
+  const body = document.getElementById("modalBody");
+  body.innerHTML = "<p class='muted'>Загрузка истории покупок...</p>";
   try {
-    const data = await apiFetch("/api/chats/" + roomUid + "/messages");
-    const msgs = data.messages || [];
-    feedEl.textContent = "";
-    if (msgs.length === 0) {
-      feedEl.textContent = "В этом чате нет сообщений.";
+    const d = await api(`/api/users/${u.tg_user_id}/orders`);
+    body.innerHTML = "";
+    const info = el("div", null, "card");
+    info.appendChild(el("div", `Telegram ID: ${u.tg_user_id} | Ник: ${u.tg_username ? "@" + u.tg_username : "—"}`));
+    info.appendChild(el("div", `Ник в GDZgo: ${u.gdz_login ? "@" + u.gdz_login : "Не привязан"} · Имя: ${u.gdz_full_name || "—"}`));
+    info.appendChild(el("div", `Всего потрачено: ⭐ ${u.total_stars_spent} (${u.paid_orders_count} оплат)`));
+    if (u.gdz_login) {
+      info.appendChild(el("div", `Баланс монет: ${u.gdz_coins} · Premium: ${u.gdz_vip ? "Активен" : "Нет"}`, "muted"));
+    }
+    body.appendChild(info);
+
+    const hTitle = el("h4", "Полная история покупок за Stars ⭐", null);
+    body.appendChild(hTitle);
+
+    const orders = d.orders || [];
+    if (!orders.length) {
+      body.appendChild(el("p", "Покупок пока не было.", "muted"));
       return;
     }
-    for (const m of msgs) {
-      const bubble = el("div", { class: "bubble" + (m.is_deleted ? " deleted" : "") });
-      bubble.appendChild(el("div", { class: "bubble-meta" }, [
-        el("span", null, (m.sender_name || "Пользователь") + " (@" + (m.sender_login || "—") + ")"),
-        el("span", null, m.created_msk + (m.is_edited ? " • ред." : "") + (m.is_deleted ? " • УДАЛЕНО" : ""))
-      ]));
-      if (m.forwarded_from_name) {
-        bubble.appendChild(el("div", { class: "bubble-quote" }, "Переслано от: " + m.forwarded_from_name));
-      }
-      if (m.reply_preview) {
-        bubble.appendChild(el("div", { class: "bubble-quote" }, (m.reply_sender_name ? (m.reply_sender_name + ": ") : "") + m.reply_preview));
-      }
-
-      let bodyTxt = m.text_body || "";
-      if (m.kind_tag === "VOICE") bodyTxt = "🎤 Голосовое (" + m.voice_sec + " сек.)" + (bodyTxt ? ("\n" + bodyTxt) : "");
-      else if (m.kind_tag === "SHARED_MATERIAL") bodyTxt = "📚 Материал: " + (m.shared_mat_title || "—") + (bodyTxt ? ("\n" + bodyTxt) : "");
-      else if (m.kind_tag === "SHARED_AI_CHAT") bodyTxt = "🤖 ИИ-чат: " + (m.shared_ai_title || "—") + (bodyTxt ? ("\n" + bodyTxt) : "");
-      else if (m.kind_tag === "IMAGE" && !bodyTxt) bodyTxt = "🖼 Фото" + (m.media_name ? (" (" + m.media_name + ")") : "");
-
-      if (bodyTxt) bubble.appendChild(el("div", { class: "bubble-text" }, bodyTxt));
-
-      if (m.has_media) {
-        const mediaHolder = el("div", { style: "margin-top:6px;" });
-        const showBtn = el("button", { class: "btn", type: "button" }, "🖼 Показать вложенное фото");
-        showBtn.onclick = async () => {
-          showBtn.disabled = true;
-          showBtn.textContent = "Загрузка...";
-          try {
-            const mr = await apiFetch("/api/chats/messages/" + m.msg_uid + "/media");
-            if (isSafeRawBase64(mr.media_b64)) {
-              const img = el("img", { class: "preview-img", src: "data:image/jpeg;base64," + mr.media_b64.trim(), alt: "Фото из чата" });
-              mediaHolder.textContent = "";
-              mediaHolder.appendChild(img);
-            } else {
-              mediaHolder.textContent = "Некорректный формат медиа.";
-            }
-          } catch (e) {
-            showBtn.textContent = "Ошибка загрузки фото";
-          }
-        };
-        mediaHolder.appendChild(showBtn);
-        bubble.appendChild(mediaHolder);
-      }
-      feedEl.appendChild(bubble);
+    const tw = el("div", null, "table-wrap");
+    const tbl = el("table");
+    tbl.innerHTML = "<thead><tr><th>Время (МСК)</th><th>Товар</th><th>Сумма</th><th>Код</th><th>Статус</th></tr></thead>";
+    const tb = el("tbody");
+    for (const o of orders) {
+      const tr = el("tr");
+      tr.appendChild(el("td", fmtTime(o.paid_ms || o.created_ms)));
+      tr.appendChild(el("td", o.item_summary));
+      tr.appendChild(el("td", "⭐ " + o.stars_amount));
+      tr.appendChild(el("td", o.pay_code));
+      tr.appendChild(el("td", o.status_tag));
+      tb.appendChild(tr);
     }
-    feedEl.scrollTop = feedEl.scrollHeight;
-  } catch (err) {
-    feedEl.textContent = "Ошибка загрузки сообщений: " + err.message;
+    tbl.appendChild(tb);
+    tw.appendChild(tbl);
+    body.appendChild(tw);
+  } catch (e) {
+    body.innerHTML = "";
+    body.appendChild(el("div", e.message, "msg err"));
   }
 }
 
-async function renderUserOrdersTab(container, info) {
-  const qs = info.tg_user_id > 0 ? ("/api/users/" + info.tg_user_id) : ("/api/gdz-users/" + info.gdz_user_id + "/detail");
-  const d = await apiFetch(qs);
-  container.textContent = "";
-  const orders = d.orders || [];
-  if (orders.length === 0) {
-    container.appendChild(el("div", { class: "card" }, "Покупок за Stars пока нет."));
-    return;
-  }
+function closeModal() {
+  document.getElementById("userModalBg").classList.remove("open");
+}
+
+function jumpToDm(tgUserId) {
+  activeTab = "messages";
+  buildTabs();
+  setTimeout(() => {
+    const inp = document.getElementById("dmTargetId");
+    if (inp) inp.value = String(tgUserId);
+  }, 150);
+}
+
+async function renderOrders() {
+  const box = document.getElementById("secOrders");
+  box.classList.remove("hide");
+  box.innerHTML = "<div class='card'>Загрузка заказов...</div>";
+  const d = await api("/api/orders");
+  box.innerHTML = "";
+  const card = el("div", null, "card");
+  card.appendChild(el("h3", "Последние заказы Telegram Stars (до 150)", null));
+  const tw = el("div", null, "table-wrap");
   const tbl = el("table");
-  tbl.appendChild(el("thead", null, el("tr", null, [
-    el("th", null, "Время (МСК)"), el("th", null, "Код"), el("th", null, "Товар"), el("th", null, "Звёзды"), el("th", null, "Статус")
-  ])));
+  tbl.innerHTML = "<thead><tr><th>ID</th><th>Время (МСК)</th><th>GDZgo / TG</th><th>Товар</th><th>⭐</th><th>Статус</th><th></th></tr></thead>";
   const tb = el("tbody");
-  for (const o of orders) {
-    tb.appendChild(el("tr", null, [
-      el("td", null, o.created_msk),
-      el("td", null, o.pay_code),
-      el("td", null, o.item_label),
-      el("td", null, "⭐ " + o.stars_amount),
-      el("td", null, statusPill(o.status_tag))
-    ]));
-  }
-  tbl.appendChild(tb);
-  container.appendChild(tbl);
-}
-
-async function renderUserDmTab(container, info) {
-  const d = await apiFetch("/api/users/" + info.tg_user_id);
-  container.textContent = "";
-  dmPhotoDataUrl = "";
-
-  const formCard = el("div", { class: "card" });
-  const ta = el("textarea", { rows: 4, placeholder: "Текст личного сообщения (или подпись к фото)..." });
-  const fileInp = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", style: "margin-top:8px;" });
-  const previewWrap = el("div");
-  const clearBtn = el("button", { class: "btn", type: "button", style: "display:none;margin-top:6px;" }, "Убрать фото");
-  const statusEl = el("div");
-
-  fileInp.onchange = () => {
-    statusEl.textContent = "";
-    readImageFile(fileInp, 5_500_000, (url) => {
-      dmPhotoDataUrl = url;
-      previewWrap.textContent = "";
-      if (isSafeImageDataUrl(url)) {
-        previewWrap.appendChild(el("img", { class: "preview-img", src: url, alt: "Превью" }));
-        clearBtn.style.display = "inline-block";
-      }
-    }, (err) => {
-      dmPhotoDataUrl = "";
-      fileInp.value = "";
-      statusEl.className = "msg err";
-      statusEl.textContent = err;
-    });
-  };
-  clearBtn.onclick = () => { dmPhotoDataUrl = ""; fileInp.value = ""; previewWrap.textContent = ""; clearBtn.style.display = "none"; };
-
-  const sendBtn = el("button", { class: "btn primary", type: "button", style: "margin-top:10px;" }, "Отправить в Telegram");
-  sendBtn.onclick = async () => {
-    statusEl.textContent = "";
-    const txt = ta.value.trim();
-    if (!txt && !dmPhotoDataUrl) {
-      statusEl.className = "msg err"; statusEl.textContent = "Введите текст или выберите фото"; return;
-    }
-    sendBtn.disabled = true;
-    try {
-      await apiFetch("/api/messages/dm", {
-        method: "POST",
-        body: JSON.stringify({ tg_user_id: info.tg_user_id, text: txt, photo_b64: dmPhotoDataUrl })
-      });
-      ta.value = "";
-      clearBtn.click();
-      statusEl.className = "msg ok";
-      statusEl.textContent = "Сообщение отправлено!";
-    } catch (e) {
-      statusEl.className = "msg err";
-      statusEl.textContent = e.message;
-    } finally {
-      sendBtn.disabled = false;
-    }
-  };
-
-  formCard.appendChild(ta);
-  formCard.appendChild(fileInp);
-  formCard.appendChild(previewWrap);
-  formCard.appendChild(clearBtn);
-  formCard.appendChild(el("div", null, sendBtn));
-  formCard.appendChild(statusEl);
-  container.appendChild(formCard);
-
-  if (d.messages && d.messages.length > 0) {
-    const hist = el("div", { class: "card" });
-    hist.appendChild(el("h4", { style: "margin:0 0 8px;" }, "История ЛС из админки"));
-    for (const m of d.messages) {
-      hist.appendChild(el("div", { style: "padding:6px 0;border-bottom:1px solid var(--bd);font-size:13px;" },
-        m.created_msk + " • " + m.sender_admin + (m.has_photo ? " [📷 Фото]" : "") + ": " + (m.message_text || "(только фото)")
-      ));
-    }
-    container.appendChild(hist);
-  }
-}
-
-async function renderBroadcast(root) {
-  root.textContent = "";
-  broadcastPhotoDataUrl = "";
-  const card = el("div", { class: "card" });
-  card.appendChild(el("h3", { style: "margin:0 0 10px;" }, "📢 Массовая рассылка в Telegram-боте"));
-
-  const aud = el("select", { style: "margin-bottom:10px;" }, [
-    el("option", { value: "all" }, "Всем активным пользователям бота"),
-    el("option", { value: "linked" }, "Только с привязанным аккаунтом GDZgo"),
-    el("option", { value: "buyers" }, "Только покупателям Stars")
-  ]);
-  const ta = el("textarea", { rows: 5, placeholder: "Текст рассылки или рекламная подпись к фото (до 1024 симв. в подписи; длинный текст придёт вторым сообщением)..." });
-  const fileInp = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", style: "margin-top:10px;" });
-  const previewWrap = el("div");
-  const clearBtn = el("button", { class: "btn", type: "button", style: "display:none;margin-top:8px;" }, "✕ Удалить фото");
-  const statusEl = el("div");
-
-  fileInp.onchange = () => {
-    statusEl.textContent = "";
-    statusEl.className = "";
-    readImageFile(fileInp, 5_500_000, (url) => {
-      broadcastPhotoDataUrl = url;
-      previewWrap.textContent = "";
-      if (isSafeImageDataUrl(url)) {
-        previewWrap.appendChild(el("img", { class: "preview-img", src: url, alt: "Превью рассылки" }));
-        clearBtn.style.display = "inline-block";
-      }
-    }, (err) => {
-      broadcastPhotoDataUrl = "";
-      fileInp.value = "";
-      statusEl.className = "msg err";
-      statusEl.textContent = err;
-    });
-  };
-  clearBtn.onclick = () => {
-    broadcastPhotoDataUrl = "";
-    fileInp.value = "";
-    previewWrap.textContent = "";
-    clearBtn.style.display = "none";
-  };
-
-  const sendBtn = el("button", { class: "btn primary", type: "button", style: "margin-top:12px;" }, "🚀 Запустить рассылку");
-  sendBtn.onclick = async () => {
-    statusEl.textContent = "";
-    statusEl.className = "";
-    const txt = ta.value.trim();
-    if (!txt && !broadcastPhotoDataUrl) {
-      statusEl.className = "msg err";
-      statusEl.textContent = "Добавьте текст или фото для рассылки.";
-      return;
-    }
-    sendBtn.disabled = true;
-    sendBtn.textContent = "Отправка...";
-    try {
-      const res = await apiFetch("/api/messages/broadcast", {
-        method: "POST",
-        body: JSON.stringify({ audience: aud.value, text: txt, photo_b64: broadcastPhotoDataUrl })
-      });
-      statusEl.className = "msg ok";
-      statusEl.textContent = "Готово! Отправлено: " + res.sent + ", ошибок/блокировок: " + res.failed + " из " + res.total;
-      ta.value = "";
-      clearBtn.click();
-    } catch (e) {
-      statusEl.className = "msg err";
-      statusEl.textContent = "Ошибка: " + e.message;
-    } finally {
-      sendBtn.disabled = false;
-      sendBtn.textContent = "🚀 Запустить рассылку";
-    }
-  };
-
-  card.appendChild(aud);
-  card.appendChild(ta);
-  card.appendChild(fileInp);
-  card.appendChild(previewWrap);
-  card.appendChild(clearBtn);
-  card.appendChild(el("div", null, sendBtn));
-  card.appendChild(statusEl);
-  root.appendChild(card);
-}
-
-async function renderModerators(root) {
-  const data = await apiFetch("/api/moderators");
-  root.textContent = "";
-  const permsCatalog = data.all_permissions || [];
-  const card = el("div", { class: "card" });
-  card.appendChild(el("h3", { style: "margin:0 0 10px;" }, "🛡️ Управление пользователями портала и модераторами"));
-
-  for (const a of (data.admins || [])) {
-    const box = el("div", { style: "border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:10px;background:var(--panel2);" });
-    const head = el("div", { class: "row", style: "justify-content:space-between;" }, [
-      el("div", null, el("strong", null, a.username + " (" + a.role + ")")),
-      el("div", { style: "font-size:12px;color:var(--muted);" }, "Создан: " + a.created_msk)
-    ]);
-    box.appendChild(head);
-
-    if (a.role !== "SUPER_ADMIN") {
-      const roleRow = el("div", { class: "row", style: "margin-top:10px;" });
-      const btnToggle = el("button", { class: "btn " + (a.role === "MODERATOR" ? "danger" : "primary"), type: "button" },
-        a.role === "MODERATOR" ? "Снять модератора (в USER)" : "Назначить MODERATOR"
-      );
-      btnToggle.onclick = async () => {
-        await apiFetch("/api/moderators/role", {
-          method: "POST",
-          body: JSON.stringify({ admin_uid: a.admin_uid, role: a.role === "MODERATOR" ? "USER" : "MODERATOR" })
-        });
-        renderModerators(root);
+  for (const o of (d.orders || [])) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "#" + o.order_uid));
+    tr.appendChild(el("td", fmtTime(o.paid_ms || o.created_ms)));
+    tr.appendChild(el("td", `@${o.buyer_login || "?"} (TG: ${o.telegram_user_id || 0})`));
+    tr.appendChild(el("td", `${o.item_summary} [${o.pay_code}]`));
+    tr.appendChild(el("td", "⭐ " + o.stars_amount));
+    tr.appendChild(el("td", o.status_tag));
+    const tdAct = el("td");
+    if (o.status_tag === "PENDING" && hasPerm("manage_orders")) {
+      const btn = el("button", "Отменить", "danger");
+      btn.onclick = async () => {
+        await api("/api/orders/cancel", { method: "POST", body: JSON.stringify({ order_uid: o.order_uid }) });
+        await renderOrders();
       };
-      roleRow.appendChild(btnToggle);
-      box.appendChild(roleRow);
-
-      if (a.role === "MODERATOR") {
-        const pWrap = el("div", { style: "margin-top:10px;display:flex;flex-wrap:wrap;gap:10px;" });
-        const checks = new Map();
-        for (const p of permsCatalog) {
-          const cb = el("input", { type: "checkbox", style: "width:auto;" });
-          cb.checked = (a.permissions || []).includes(p.key);
-          checks.set(p.key, cb);
-          pWrap.appendChild(el("label", { style: "display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;" }, [cb, p.label]));
-        }
-        const saveP = el("button", { class: "btn primary", type: "button", style: "margin-top:8px;" }, "Сохранить права");
-        saveP.onclick = async () => {
-          const selected = [];
-          for (const [k, cb] of checks.entries()) if (cb.checked) selected.push(k);
-          await apiFetch("/api/moderators/perms", {
-            method: "POST",
-            body: JSON.stringify({ admin_uid: a.admin_uid, permissions: selected })
-          });
-          saveP.textContent = "✅ Сохранено";
-          setTimeout(() => { saveP.textContent = "Сохранить права"; }, 1200);
-        };
-        box.appendChild(pWrap);
-        box.appendChild(saveP);
-      }
+      tdAct.appendChild(btn);
     }
-    card.appendChild(box);
+    tr.appendChild(tdAct);
+    tb.appendChild(tr);
   }
-  root.appendChild(card);
+  tbl.appendChild(tb);
+  tw.appendChild(tbl);
+  card.appendChild(tw);
+  box.appendChild(card);
 }
+
+async function renderMessages() {
+  const box = document.getElementById("secMessages");
+  box.classList.remove("hide");
+  box.innerHTML = "<div class='card'>Загрузка...</div>";
+  const [hist, usrResp] = await Promise.all([
+    api("/api/messages/history"),
+    hasPerm("view_users") ? api("/api/users") : Promise.resolve({ users: cachedUsers })
+  ]);
+  const usersList = usrResp.users || [];
+  box.innerHTML = "";
+
+  if (hasPerm("send_dm")) {
+    const dmCard = el("div", null, "card");
+    dmCard.appendChild(el("h3", "Личное сообщение конкретному пользователю", null));
+    if (usersList.length) {
+      const selLbl = el("label", "Быстрый выбор из пользователей бота:");
+      const sel = el("select");
+      const opt0 = el("option", "— Выберите или введите Telegram ID ниже —");
+      opt0.value = "";
+      sel.appendChild(opt0);
+      for (const u of usersList) {
+        const op = el("option", `${u.tg_username ? "@" + u.tg_username : u.first_name || "User"} (GDZgo: @${u.gdz_login || "—"}) · ID ${u.tg_user_id}`);
+        op.value = String(u.tg_user_id);
+        sel.appendChild(op);
+      }
+      sel.onchange = () => { if (sel.value) document.getElementById("dmTargetId").value = sel.value; };
+      dmCard.appendChild(selLbl);
+      dmCard.appendChild(sel);
+    }
+    dmCard.appendChild(el("label", "Telegram User ID:"));
+    const tid = el("input"); tid.id = "dmTargetId"; tid.placeholder = "например: 123456789";
+    dmCard.appendChild(tid);
+    dmCard.appendChild(el("label", "Текст сообщения:"));
+    const txt = el("textarea"); txt.id = "dmText"; txt.placeholder = "Введите сообщение пользователю...";
+    dmCard.appendChild(txt);
+    const dmRes = el("div"); dmRes.id = "dmRes";
+    dmCard.appendChild(dmRes);
+    const btn = el("button", "Отправить пользователю");
+    btn.onclick = async () => {
+      try {
+        const res = await api("/api/messages/dm", {
+          method: "POST",
+          body: JSON.stringify({ tg_user_id: Number(tid.value.trim()), text: txt.value })
+        });
+        txt.value = "";
+        showMsg("dmRes", res.message || "Отправлено!", false);
+        await renderMessages();
+      } catch (e) {
+        showMsg("dmRes", e.message, true);
+      }
+    };
+    dmCard.appendChild(btn);
+    box.appendChild(dmCard);
+  }
+
+  if (hasPerm("send_broadcast")) {
+    const bcCard = el("div", null, "card");
+    bcCard.appendChild(el("h3", "Рассылка всем пользователям бота", null));
+    bcCard.appendChild(el("p", "Сообщение получат все пользователи из базы бота (banka_bot_users).", "muted"));
+    const bTxt = el("textarea"); bTxt.id = "bcText"; bTxt.placeholder = "Текст массовой рассылки...";
+    bcCard.appendChild(bTxt);
+    const bcRes = el("div"); bcRes.id = "bcRes";
+    bcCard.appendChild(bcRes);
+    const bBtn = el("button", "Запустить рассылку всем");
+    bBtn.onclick = async () => {
+      if (!confirm("Отправить это сообщение ВСЕМ пользователям бота?")) return;
+      bBtn.disabled = true;
+      try {
+        const res = await api("/api/messages/broadcast", {
+          method: "POST",
+          body: JSON.stringify({ text: bTxt.value })
+        });
+        bTxt.value = "";
+        showMsg("bcRes", `Рассылка завершена: доставлено ${res.sent}, ошибок ${res.failed}.`, false);
+        await renderMessages();
+      } catch (e) {
+        showMsg("bcRes", e.message, true);
+      } finally {
+        bBtn.disabled = false;
+      }
+    };
+    bcCard.appendChild(bBtn);
+    box.appendChild(bcCard);
+  }
+
+  const hCard = el("div", null, "card");
+  hCard.appendChild(el("h3", "Журнал отправленных сообщений и рассылок", null));
+  const tw = el("div", null, "table-wrap");
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th>Время (МСК)</th><th>Тип</th><th>Отправитель</th><th>Получатель / Охват</th><th>Текст</th></tr></thead>";
+  const tb = el("tbody");
+  for (const r of (hist.logs || [])) {
+    const tr = el("tr");
+    tr.appendChild(el("td", fmtTime(r.created_ms)));
+    tr.appendChild(el("td", r.kind === "BROADCAST" ? "Рассылка" : "Личное"));
+    tr.appendChild(el("td", "@" + r.sender_login));
+    tr.appendChild(el("td", r.kind === "BROADCAST" ? `Доставлено: ${r.sent_count}, ошибок: ${r.failed_count}` : `TG ID ${r.target_tg_user_id}`));
+    tr.appendChild(el("td", r.message_text));
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb);
+  tw.appendChild(tbl);
+  hCard.appendChild(tw);
+  box.appendChild(hCard);
+}
+
+async function renderAdmins() {
+  const box = document.getElementById("secAdmins");
+  box.classList.remove("hide");
+  box.innerHTML = "<div class='card'>Загрузка списка аккаунтов...</div>";
+  const d = await api("/api/admins");
+  box.innerHTML = "";
+
+  const card = el("div", null, "card");
+  card.appendChild(el("h3", "Управление модераторами и кастомными правами", null));
+  card.appendChild(el("p", "Обычные пользователи после регистрации видят сообщение «Вы не админ и не модератор». Назначьте роль MODERATOR и отметьте нужные права.", "muted"));
+
+  for (const acc of (d.accounts || [])) {
+    const item = el("div", null, "kpi");
+    item.style.marginBottom = "12px";
+
+    const top = el("div");
+    top.style.display = "flex";
+    top.style.justifyContent = "space-between";
+    top.style.flexWrap = "wrap";
+    top.style.gap = "8px";
+    top.appendChild(el("strong", `${acc.display_name} (@${acc.login}) — ${acc.role}`));
+    top.appendChild(el("span", `Регистрация: ${fmtTime(acc.created_ms)}`, "muted"));
+    item.appendChild(top);
+
+    if (acc.role === "SUPER_ADMIN") {
+      item.appendChild(el("div", "Супер-Администратор имеет все права и не может быть понижен.", "muted"));
+      card.appendChild(item);
+      continue;
+    }
+
+    const roleSel = el("select");
+    roleSel.style.maxWidth = "260px";
+    [["USER", "USER (Нет доступа)"], ["MODERATOR", "MODERATOR (Доступ по правам)"]].forEach(([rv, rl]) => {
+      const op = el("option", rl);
+      op.value = rv;
+      if (acc.role === rv) op.selected = true;
+      roleSel.appendChild(op);
+    });
+    item.appendChild(roleSel);
+
+    const pGrid = el("div", null, "perm-grid");
+    const checks = {};
+    for (const [pk, pl] of Object.entries(PERM_LABELS)) {
+      const lbl = el("label", null, "perm-item");
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = !!(acc.permissions && acc.permissions[pk]);
+      checks[pk] = cb;
+      lbl.appendChild(cb);
+      lbl.appendChild(el("span", pl));
+      pGrid.appendChild(lbl);
+    }
+    item.appendChild(pGrid);
+
+    const saveRow = el("div", null, "row-actions");
+    saveRow.style.marginTop = "10px";
+    const saveBtn = el("button", "Сохранить роль и права");
+    saveBtn.onclick = async () => {
+      const perms = {};
+      for (const k of Object.keys(checks)) perms[k] = checks[k].checked;
+      await api("/api/admins/role", {
+        method: "POST",
+        body: JSON.stringify({ web_uid: acc.web_uid, role: roleSel.value, permissions: perms })
+      });
+      showMsg("panelAlert", `Права для @${acc.login} обновлены!`, false);
+      await renderAdmins();
+    };
+    saveRow.appendChild(saveBtn);
+    item.appendChild(saveRow);
+    card.appendChild(item);
+  }
+  box.appendChild(card);
+}
+
+bootstrap();
 </script>
 </body>
 </html>
 """
 
 
-# ============================================================
-# HTTP-СЕРВЕР ДЛЯ RENDER (СТАБИЛЬНЫЙ HTTP/1.0 + ПЕРЕХВАТ ОШИБОК)
-# ============================================================
-class AdminHttpHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"
+class PortalHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:
+        return
 
-    def log_message(self, format, *args):
-        pass
+    def _send_json(self, code: int, obj: Any) -> None:
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
-    def _send_bytes(self, code: int, content_type: str, raw: bytes):
-        try:
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Connection", "close")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(raw)
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+    def _send_html(self, code: int, body: str) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
-    def _send_json(self, code: int, obj: dict):
-        self._send_bytes(code, "application/json; charset=utf-8", json.dumps(obj, ensure_ascii=False).encode("utf-8"))
-
-    def _read_json(self) -> dict:
-        cl = int(self.headers.get("Content-Length", "0") or "0")
-        if cl <= 0:
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0 or length > 256_000:
             return {}
-        if cl > MAX_JSON_BODY_BYTES:
-            raise ValueError("Payload too large (max 8 MB)")
-        raw = self.rfile.read(cl)
-        return json.loads(raw.decode("utf-8"))
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
-    def _get_auth_admin(self) -> dict | None:
-        auth_h = self.headers.get("Authorization", "")
-        if not auth_h.startswith("Bearer "):
+    def _current_web_user(self) -> dict[str, Any] | None:
+        auth = (self.headers.get("Authorization") or "").strip()
+        if not auth.lower().startswith("bearer "):
             return None
-        token = auth_h[7:].strip()
+        token = auth[7:].strip()
         if not token:
             return None
-
-        def _op(conn):
+        thash = hash_token(token)
+        ts = now_ms()
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT a.admin_uid, a.username, a.role, a.permissions_json
+                    SELECT a.*
                     FROM banka_bot_web_sessions s
-                    JOIN banka_bot_web_admins a ON a.admin_uid = s.admin_uid
-                    WHERE s.token = %s AND s.expires_at > CURRENT_TIMESTAMP
+                    JOIN banka_bot_web_admins a ON a.web_uid = s.web_uid
+                    WHERE s.token_hash = %s AND s.expires_ms > %s
                     LIMIT 1;
                     """,
-                    (token,),
+                    (thash, ts),
                 )
                 row = cur.fetchone()
-                if not row:
-                    return None
-                return {
-                    "admin_uid": int(row[0]),
-                    "username": row[1],
-                    "role": row[2],
-                    "permissions": parse_perms(row[3]),
-                    "token": token,
-                }
+                return serialize_admin(row) if row else None
 
-        return with_db(_op)
-
-    def _require_perm(self, perm: str | None = None) -> dict | None:
-        admin = self._get_auth_admin()
-        if not admin:
+    def _require_perm(self, perm: str | None = None) -> dict[str, Any] | None:
+        user = self._current_web_user()
+        if not user:
             self._send_json(401, {"error": "Требуется авторизация"})
             return None
-        if admin["role"] == "USER":
+        if user["role"] not in (ROLE_SUPER_ADMIN, ROLE_MODERATOR):
             self._send_json(403, {"error": "Вы не админ и не модератор"})
             return None
-        if perm and not user_has_perm(admin, perm):
-            self._send_json(403, {"error": f"Нет доступа ({perm})"})
+        if perm and not has_perm(user, perm):
+            self._send_json(403, {"error": f"Недостаточно прав ({perm})"})
             return None
-        return admin
+        return user
 
-    def do_GET(self):
-        try:
-            self._dispatch_get()
-        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
-            print(f"[HTTP GET DB ERROR] {exc}", flush=True)
-            self._send_json(503, {"error": "Временная ошибка подключения к БД. Повторите запрос."})
-        except Exception as exc:
-            print(f"[HTTP GET ERROR] {exc}", flush=True)
-            self._send_json(500, {"error": f"Внутренняя ошибка сервера: {exc}"})
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path.rstrip("/") or "/"
 
-    def do_POST(self):
-        try:
-            self._dispatch_post()
-        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
-            print(f"[HTTP POST DB ERROR] {exc}", flush=True)
-            self._send_json(503, {"error": "Временная ошибка подключения к БД. Повторите запрос."})
-        except Exception as exc:
-            print(f"[HTTP POST ERROR] {exc}", flush=True)
-            self._send_json(500, {"error": f"Внутренняя ошибка сервера: {exc}"})
-
-    def _dispatch_get(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        qs = parse_qs(parsed.query)
-
-        if path in ("/", "/index.html"):
-            self._send_bytes(200, "text/html; charset=utf-8", PUBLIC_HTML.encode("utf-8"))
-            return
-        if path in ("/admin", "/admin/"):
-            self._send_bytes(200, "text/html; charset=utf-8", ADMIN_HTML.encode("utf-8"))
-            return
         if path == "/health":
-            self._send_json(200, {"ok": True, "db_ready": _db_initialized})
+            self._send_json(200, {"ok": True})
+            return
+
+        if path in ("/", "/admin"):
+            self._send_html(200, HTML_PAGE)
+            return
+
+        if path == "/api/auth/status":
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM banka_bot_web_admins WHERE role = %s LIMIT 1;", (ROLE_SUPER_ADMIN,))
+                    has_super = cur.fetchone() is not None
+            self._send_json(200, {"has_super_admin": has_super})
             return
 
         if path == "/api/auth/me":
-            admin = self._get_auth_admin()
-            if not admin:
+            user = self._current_web_user()
+            if not user:
                 self._send_json(401, {"error": "Не авторизован"})
                 return
-            self._send_json(200, admin)
+            self._send_json(200, {"user": user})
             return
 
-        if path == "/api/dashboard":
-            if self._require_perm("view_dashboard"):
-                self._handle_dashboard()
+        if path == "/api/stats":
+            if not self._require_perm("view_stats"):
+                return
+            now_msk = datetime.now(MSK_TZ)
+            today_mid = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_ms = int(today_mid.timestamp() * 1000)
+            week_ms = now_ms() - 7 * 86_400_000
+            month_ms = now_ms() - 30 * 86_400_000
+
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            COUNT(*) FILTER (WHERE status_tag = 'PAID') AS all_deals,
+                            COALESCE(SUM(stars_amount) FILTER (WHERE status_tag = 'PAID'), 0) AS all_stars,
+                            COUNT(*) FILTER (WHERE status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s) AS day_deals,
+                            COALESCE(SUM(stars_amount) FILTER (WHERE status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s), 0) AS day_stars,
+                            COUNT(*) FILTER (WHERE status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s) AS week_deals,
+                            COALESCE(SUM(stars_amount) FILTER (WHERE status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s), 0) AS week_stars,
+                            COUNT(*) FILTER (WHERE status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s) AS month_deals,
+                            COALESCE(SUM(stars_amount) FILTER (WHERE status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s), 0) AS month_stars,
+                            COUNT(*) FILTER (WHERE status_tag = 'PENDING') AS pending_count,
+                            COUNT(*) FILTER (WHERE status_tag = 'CANCELLED') AS cancelled_count,
+                            COUNT(DISTINCT buyer_uid) FILTER (WHERE status_tag = 'PAID') AS paying_users
+                        FROM banka_stars_orders;
+                        """,
+                        (day_ms, day_ms, week_ms, week_ms, month_ms, month_ms),
+                    )
+                    agg = cur.fetchone() or {}
+                    cur.execute("SELECT COUNT(*) AS cnt FROM banka_bot_users;")
+                    bot_users_cnt = int((cur.fetchone() or {}).get("cnt") or 0)
+                    cur.execute(
+                        """
+                        SELECT item_kind,
+                               COUNT(*) AS deals,
+                               COALESCE(SUM(stars_amount), 0) AS stars
+                        FROM banka_stars_orders
+                        WHERE status_tag = 'PAID'
+                        GROUP BY item_kind
+                        ORDER BY stars DESC;
+                        """
+                    )
+                    by_kind_rows = cur.fetchall()
+
+            kind_names = {
+                "PREMIUM_10": "Premium 10 дней",
+                "PREMIUM_30": "Premium 30 дней",
+                "COINS": "Монеты GDZgo",
+                "BACKGROUND": "Фоны профиля",
+            }
+            self._send_json(
+                200,
+                {
+                    "day": {"deals": int(agg.get("day_deals") or 0), "stars": int(agg.get("day_stars") or 0)},
+                    "week": {"deals": int(agg.get("week_deals") or 0), "stars": int(agg.get("week_stars") or 0)},
+                    "month": {"deals": int(agg.get("month_deals") or 0), "stars": int(agg.get("month_stars") or 0)},
+                    "all": {"deals": int(agg.get("all_deals") or 0), "stars": int(agg.get("all_stars") or 0)},
+                    "pending_count": int(agg.get("pending_count") or 0),
+                    "cancelled_count": int(agg.get("cancelled_count") or 0),
+                    "paying_users_count": int(agg.get("paying_users") or 0),
+                    "bot_users_count": bot_users_cnt,
+                    "by_kind": [
+                        {
+                            "item_kind": r["item_kind"],
+                            "kind_label": kind_names.get(str(r["item_kind"]).upper(), str(r["item_kind"])),
+                            "deals": int(r["deals"]),
+                            "stars": int(r["stars"]),
+                        }
+                        for r in by_kind_rows
+                    ],
+                },
+            )
             return
 
         if path == "/api/users":
-            if self._require_perm("view_users"):
-                q = (qs.get("q", [""])[0] or "").strip()
-                self._handle_bot_users(q)
-            return
-
-        if path == "/api/gdz-users":
-            admin = self._get_auth_admin()
-            if not admin or not (user_has_perm(admin, "view_users") or user_has_perm(admin, "view_chats")):
-                self._send_json(403, {"error": "Нет доступа"})
+            if not self._require_perm("view_users"):
                 return
-            q = (qs.get("q", [""])[0] or "").strip()
-            self._handle_gdz_users(q)
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        WITH ord_agg AS (
+                            SELECT telegram_user_id,
+                                   COALESCE(SUM(stars_amount) FILTER (WHERE status_tag = 'PAID'), 0) AS spent_stars,
+                                   COUNT(*) FILTER (WHERE status_tag = 'PAID') AS paid_cnt,
+                                   MAX(buyer_uid) AS last_buyer_uid,
+                                   MAX(buyer_login) FILTER (WHERE buyer_login <> '') AS last_buyer_login
+                            FROM banka_stars_orders
+                            WHERE telegram_user_id > 0
+                            GROUP BY telegram_user_id
+                        )
+                        SELECT bu.tg_user_id, bu.tg_username, bu.first_name, bu.last_name,
+                               bu.first_seen_ms, bu.last_seen_ms,
+                               COALESCE(NULLIF(bu.linked_gdz_uid, 0), oa.last_buyer_uid, 0) AS resolved_uid,
+                               COALESCE(NULLIF(bu.linked_gdz_login, ''), oa.last_buyer_login, '') AS fallback_login,
+                               COALESCE(oa.spent_stars, 0) AS total_stars_spent,
+                               COALESCE(oa.paid_cnt, 0) AS paid_orders_count,
+                               p.entry_tag AS p_login,
+                               p.title_first AS p_first,
+                               p.title_last AS p_last,
+                               p.cohort_code AS p_class,
+                               COALESCE(p.vip_flag, FALSE) AS p_vip,
+                               COALESCE(p.vault_tokens, 0) AS p_coins
+                        FROM banka_bot_users bu
+                        LEFT JOIN ord_agg oa ON oa.telegram_user_id = bu.tg_user_id
+                        LEFT JOIN banka_profiles_vault p
+                               ON p.rec_uid = COALESCE(NULLIF(bu.linked_gdz_uid, 0), oa.last_buyer_uid, 0)
+                        ORDER BY bu.last_seen_ms DESC
+                        LIMIT 500;
+                        """
+                    )
+                    rows = cur.fetchall()
+
+            users_out = []
+            for r in rows:
+                full_name = f"{r.get('p_first') or ''} {r.get('p_last') or ''}".strip()
+                users_out.append(
+                    {
+                        "tg_user_id": int(r["tg_user_id"]),
+                        "tg_username": str(r.get("tg_username") or ""),
+                        "first_name": str(r.get("first_name") or ""),
+                        "last_name": str(r.get("last_name") or ""),
+                        "first_seen_ms": int(r.get("first_seen_ms") or 0),
+                        "last_seen_ms": int(r.get("last_seen_ms") or 0),
+                        "gdz_uid": int(r.get("resolved_uid") or 0),
+                        "gdz_login": str(r.get("p_login") or r.get("fallback_login") or ""),
+                        "gdz_full_name": full_name,
+                        "gdz_class": str(r.get("p_class") or ""),
+                        "gdz_vip": bool(r.get("p_vip")),
+                        "gdz_coins": int(r.get("p_coins") or 0),
+                        "total_stars_spent": int(r.get("total_stars_spent") or 0),
+                        "paid_orders_count": int(r.get("paid_orders_count") or 0),
+                    }
+                )
+            self._send_json(200, {"users": users_out})
             return
 
-        if path.startswith("/api/gdz-users/") and path.endswith("/chats"):
-            if self._require_perm("view_chats"):
-                try:
-                    gdz_uid = int(path.split("/")[3])
-                except Exception:
-                    self._send_json(400, {"error": "Некорректный ID"})
-                    return
-                self._handle_gdz_user_chats(gdz_uid)
-            return
-
-        if path.startswith("/api/gdz-users/") and path.endswith("/detail"):
-            if self._require_perm("view_users"):
-                try:
-                    gdz_uid = int(path.split("/")[3])
-                except Exception:
-                    self._send_json(400, {"error": "Некорректный ID"})
-                    return
-                self._handle_gdz_user_detail(gdz_uid)
-            return
-
-        if path.startswith("/api/users/") and path.endswith("/chats"):
-            if self._require_perm("view_chats"):
-                try:
-                    tg_id = int(path.split("/")[3])
-                except Exception:
-                    self._send_json(400, {"error": "Некорректный ID"})
-                    return
-                self._handle_tg_user_chats(tg_id)
-            return
-
-        if path.startswith("/api/users/"):
-            if self._require_perm("view_users"):
-                try:
-                    tg_id = int(path.split("/")[3])
-                except Exception:
-                    self._send_json(400, {"error": "Некорректный ID"})
-                    return
-                self._handle_tg_user_detail(tg_id)
-            return
-
-        if path.startswith("/api/chats/messages/") and path.endswith("/media"):
-            if self._require_perm("view_chats"):
-                try:
-                    msg_uid = int(path.split("/")[4])
-                except Exception:
-                    self._send_json(400, {"error": "Некорректный msg_uid"})
-                    return
-                self._handle_chat_message_media(msg_uid)
-            return
-
-        if path.startswith("/api/chats/") and path.endswith("/messages"):
-            if self._require_perm("view_chats"):
-                try:
-                    room_uid = int(path.split("/")[3])
-                except Exception:
-                    self._send_json(400, {"error": "Некорректный room_uid"})
-                    return
-                self._handle_chat_messages(room_uid)
-            return
-
-        if path == "/api/moderators":
-            admin = self._require_perm(None)
-            if not admin:
+        if path.startswith("/api/users/") and path.endswith("/orders"):
+            if not (has_perm(self._current_web_user(), "view_users") or has_perm(self._current_web_user(), "view_orders")):
+                self._require_perm("view_users")
                 return
-            if admin["role"] != "SUPER_ADMIN":
-                self._send_json(403, {"error": "Только для Супер-администратора"})
+            try:
+                tg_id = int(path.split("/")[3])
+            except Exception:
+                self._send_json(400, {"error": "Некорректный Telegram ID"})
                 return
-            self._handle_list_moderators()
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT linked_gdz_uid FROM banka_bot_users WHERE tg_user_id = %s;", (tg_id,))
+                    bu = cur.fetchone()
+                    linked_uid = int(bu["linked_gdz_uid"]) if bu else 0
+                    cur.execute(
+                        """
+                        SELECT o.order_uid, o.pay_code, o.buyer_uid, o.buyer_login,
+                               o.item_kind, o.plan_days, o.coins_amount, o.target_bg_id,
+                               o.stars_amount, o.status_tag, o.telegram_user_id,
+                               o.created_ms, o.paid_ms,
+                               COALESCE(b.title_txt, '') AS bg_title
+                        FROM banka_stars_orders o
+                        LEFT JOIN banka_shop_backgrounds b ON b.bg_uid = o.target_bg_id
+                        WHERE o.telegram_user_id = %s OR (%s > 0 AND o.buyer_uid = %s)
+                        ORDER BY o.order_uid DESC
+                        LIMIT 200;
+                        """,
+                        (tg_id, linked_uid, linked_uid),
+                    )
+                    rows = cur.fetchall()
+            out = []
+            for o in rows:
+                summary, _ = describe_order(o)
+                out.append(
+                    {
+                        "order_uid": int(o["order_uid"]),
+                        "pay_code": str(o["pay_code"]),
+                        "stars_amount": int(o["stars_amount"]),
+                        "status_tag": str(o["status_tag"]),
+                        "item_summary": summary,
+                        "created_ms": int(o["created_ms"]),
+                        "paid_ms": int(o["paid_ms"]) if o["paid_ms"] else None,
+                    }
+                )
+            self._send_json(200, {"orders": out})
             return
 
-        self._send_json(404, {"error": "Not found"})
+        if path == "/api/orders":
+            if not self._require_perm("view_orders"):
+                return
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT o.order_uid, o.pay_code, o.buyer_uid, o.buyer_login,
+                               o.item_kind, o.plan_days, o.coins_amount, o.target_bg_id,
+                               o.stars_amount, o.status_tag, o.telegram_user_id,
+                               o.created_ms, o.paid_ms,
+                               COALESCE(b.title_txt, '') AS bg_title
+                        FROM banka_stars_orders o
+                        LEFT JOIN banka_shop_backgrounds b ON b.bg_uid = o.target_bg_id
+                        ORDER BY o.order_uid DESC
+                        LIMIT 150;
+                        """
+                    )
+                    rows = cur.fetchall()
+            out = []
+            for o in rows:
+                summary, _ = describe_order(o)
+                out.append(
+                    {
+                        "order_uid": int(o["order_uid"]),
+                        "pay_code": str(o["pay_code"]),
+                        "buyer_login": str(o.get("buyer_login") or ""),
+                        "telegram_user_id": int(o.get("telegram_user_id") or 0),
+                        "stars_amount": int(o["stars_amount"]),
+                        "status_tag": str(o["status_tag"]),
+                        "item_summary": summary,
+                        "created_ms": int(o["created_ms"]),
+                        "paid_ms": int(o["paid_ms"]) if o["paid_ms"] else None,
+                    }
+                )
+            self._send_json(200, {"orders": out})
+            return
 
-    def _dispatch_post(self):
-        path = urlparse(self.path).path
-        try:
-            body = self._read_json()
-        except ValueError as e:
-            self._send_json(413 if "large" in str(e).lower() else 400, {"error": str(e)})
+        if path == "/api/messages/history":
+            user = self._current_web_user()
+            if not user or not (has_perm(user, "send_dm") or has_perm(user, "send_broadcast")):
+                self._require_perm("send_dm")
+                return
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM banka_bot_messages_log ORDER BY log_uid DESC LIMIT 80;"
+                    )
+                    logs = cur.fetchall()
+            self._send_json(200, {"logs": logs})
             return
-        except Exception:
-            self._send_json(400, {"error": "Некорректный JSON"})
+
+        if path == "/api/admins":
+            user = self._require_perm(None)
+            if not user:
+                return
+            if user["role"] != ROLE_SUPER_ADMIN:
+                self._send_json(403, {"error": "Только Супер-Администратор управляет модераторами"})
+                return
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM banka_bot_web_admins ORDER BY web_uid ASC;")
+                    accounts = [serialize_admin(r) for r in cur.fetchall()]
+            self._send_json(200, {"accounts": accounts})
             return
+
+        self._send_json(404, {"error": "Не найдено"})
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path.rstrip("/")
+        body = self._read_json()
 
         if path == "/api/auth/register":
-            self._handle_register(body)
+            login = str(body.get("login") or "").strip().lower()
+            password = str(body.get("password") or "")
+            display_name = str(body.get("display_name") or "").strip()[:120] or login
+            if len(login) < 3 or len(login) > 64:
+                self._send_json(400, {"error": "Логин должен быть от 3 до 64 символов"})
+                return
+            if len(password) < 6:
+                self._send_json(400, {"error": "Пароль должен содержать минимум 6 символов"})
+                return
+            salt_hex, pwd_hash = hash_password(password)
+            ts = now_ms()
+            raw_token = secrets.token_urlsafe(32)
+            thash = hash_token(raw_token)
+            try:
+                with db_connect() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute("LOCK TABLE banka_bot_web_admins IN EXCLUSIVE MODE;")
+                            cur.execute("SELECT COUNT(*) AS cnt FROM banka_bot_web_admins;")
+                            cnt = int((cur.fetchone() or {}).get("cnt") or 0)
+                            is_first = cnt == 0
+                            role = ROLE_SUPER_ADMIN if is_first else ROLE_USER
+                            perms_json = json.dumps({k: True for k in ALL_PERMISSIONS}) if is_first else "{}"
+                            cur.execute(
+                                """
+                                INSERT INTO banka_bot_web_admins (
+                                    login, display_name, pwd_salt, pwd_hash, role, perms_json, created_ms, last_login_ms
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING *;
+                                """,
+                                (login, display_name, salt_hex, pwd_hash, role, perms_json, ts, ts),
+                            )
+                            new_user = cur.fetchone()
+                            cur.execute(
+                                """
+                                INSERT INTO banka_bot_web_sessions (token_hash, web_uid, created_ms, expires_ms)
+                                VALUES (%s, %s, %s, %s);
+                                """,
+                                (thash, new_user["web_uid"], ts, ts + 7 * 86_400_000),
+                            )
+                self._send_json(200, {"token": raw_token, "user": serialize_admin(new_user)})
+            except psycopg.errors.UniqueViolation:
+                self._send_json(409, {"error": "Такой логин уже занят"})
+            except Exception as e:
+                self._send_json(500, {"error": f"Ошибка регистрации: {e}"})
             return
+
         if path == "/api/auth/login":
-            self._handle_login(body)
+            login = str(body.get("login") or "").strip().lower()
+            password = str(body.get("password") or "")
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM banka_bot_web_admins WHERE login = %s LIMIT 1;", (login,))
+                    row = cur.fetchone()
+                    if not row or not verify_password(password, row["pwd_salt"], row["pwd_hash"]):
+                        self._send_json(401, {"error": "Неверный логин или пароль"})
+                        return
+                    ts = now_ms()
+                    raw_token = secrets.token_urlsafe(32)
+                    thash = hash_token(raw_token)
+                    cur.execute(
+                        "UPDATE banka_bot_web_admins SET last_login_ms = %s WHERE web_uid = %s;",
+                        (ts, row["web_uid"]),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO banka_bot_web_sessions (token_hash, web_uid, created_ms, expires_ms)
+                        VALUES (%s, %s, %s, %s);
+                        """,
+                        (thash, row["web_uid"], ts, ts + 7 * 86_400_000),
+                    )
+            self._send_json(200, {"token": raw_token, "user": serialize_admin(row)})
             return
+
         if path == "/api/auth/logout":
-            admin = self._get_auth_admin()
-            if admin:
-                with_db(lambda conn: (
-                    conn.cursor().execute("DELETE FROM banka_bot_web_sessions WHERE token = %s;", (admin["token"],)),
-                    conn.commit(),
-                ))
+            auth = (self.headers.get("Authorization") or "").strip()
+            if auth.lower().startswith("bearer "):
+                thash = hash_token(auth[7:].strip())
+                with db_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM banka_bot_web_sessions WHERE token_hash = %s;", (thash,))
+            self._send_json(200, {"ok": True})
+            return
+
+        if path == "/api/orders/cancel":
+            if not self._require_perm("manage_orders"):
+                return
+            try:
+                order_uid = int(body.get("order_uid") or 0)
+            except Exception:
+                order_uid = 0
+            if order_uid <= 0:
+                self._send_json(400, {"error": "Некорректный ID заказа"})
+                return
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE banka_stars_orders SET status_tag = 'CANCELLED' WHERE order_uid = %s AND status_tag = 'PENDING';",
+                        (order_uid,),
+                    )
+            delete_uncleaned_invoices_for_order(order_uid)
             self._send_json(200, {"ok": True})
             return
 
         if path == "/api/messages/dm":
-            admin = self._require_perm("send_dm")
-            if admin:
-                self._handle_dm(admin, body)
+            user = self._require_perm("send_dm")
+            if not user:
+                return
+            try:
+                tg_id = int(body.get("tg_user_id") or 0)
+            except Exception:
+                tg_id = 0
+            text = str(body.get("text") or "").strip()
+            if tg_id == 0 or not text:
+                self._send_json(400, {"error": "Укажите Telegram ID и текст сообщения"})
+                return
+            try:
+                bot.send_message(tg_id, text[:4000])
+            except Exception as e:
+                self._send_json(400, {"error": f"Не удалось доставить в Telegram: {e}"})
+                return
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO banka_bot_messages_log (
+                            sender_web_uid, sender_login, kind, target_tg_user_id,
+                            message_text, sent_count, failed_count, created_ms
+                        )
+                        VALUES (%s, %s, 'DM', %s, %s, 1, 0, %s);
+                        """,
+                        (user["web_uid"], user["login"], tg_id, text[:4000], now_ms()),
+                    )
+            self._send_json(200, {"message": f"Сообщение отправлено пользователю {tg_id}."})
             return
 
         if path == "/api/messages/broadcast":
-            admin = self._require_perm("broadcast")
-            if admin:
-                self._handle_broadcast(admin, body)
-            return
-
-        if path == "/api/moderators/role":
-            admin = self._require_perm(None)
-            if not admin:
+            user = self._require_perm("send_broadcast")
+            if not user:
                 return
-            if admin["role"] != "SUPER_ADMIN":
-                self._send_json(403, {"error": "Только для Супер-администратора"})
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self._send_json(400, {"error": "Введите текст рассылки"})
                 return
-            self._handle_set_mod_role(admin, body)
-            return
-
-        if path == "/api/moderators/perms":
-            admin = self._require_perm(None)
-            if not admin:
-                return
-            if admin["role"] != "SUPER_ADMIN":
-                self._send_json(403, {"error": "Только для Супер-администратора"})
-                return
-            self._handle_set_mod_perms(body)
-            return
-
-        self._send_json(404, {"error": "Not found"})
-
-    # -------- Handlers --------
-    def _handle_register(self, body: dict):
-        username = str(body.get("username", "")).strip()
-        password = str(body.get("password", ""))
-        if len(username) < 3 or len(username) > 50 or any(c.isspace() for c in username) or len(password) < 4:
-            self._send_json(400, {"error": "Логин от 3 до 50 символов без пробелов, пароль от 4 символов"})
-            return
-        pw_hash = hash_password(password)
-        all_perm_json = json.dumps([k for k, _ in ALL_PERMISSIONS])
-
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute("LOCK TABLE banka_bot_web_admins IN EXCLUSIVE MODE;")
-                cur.execute("SELECT COUNT(*) FROM banka_bot_web_admins WHERE role = 'SUPER_ADMIN';")
-                super_cnt = int(cur.fetchone()[0])
-                role = "SUPER_ADMIN" if super_cnt == 0 else "USER"
-                perms_json = all_perm_json if super_cnt == 0 else "[]"
-                cur.execute("SELECT 1 FROM banka_bot_web_admins WHERE LOWER(username) = LOWER(%s) LIMIT 1;", (username,))
-                if cur.fetchone():
-                    return None, "exists"
-                cur.execute(
-                    """
-                    INSERT INTO banka_bot_web_admins (username, password_hash, role, permissions_json)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING admin_uid;
-                    """,
-                    (username, pw_hash, role, perms_json),
-                )
-                uid = int(cur.fetchone()[0])
-            conn.commit()
-            return (uid, role), None
-
-        res, err = with_db(_op)
-        if err == "exists":
-            self._send_json(409, {"error": "Такой логин уже занят"})
-            return
-        uid, role = res
-        self._send_json(200, {"admin_uid": uid, "username": username, "role": role})
-
-    def _handle_login(self, body: dict):
-        username = str(body.get("username", "")).strip()
-        password = str(body.get("password", ""))
-
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT admin_uid, username, password_hash, role, permissions_json FROM banka_bot_web_admins WHERE LOWER(username) = LOWER(%s) LIMIT 1;",
-                    (username,),
-                )
-                row = cur.fetchone()
-                if not row or not verify_password(password, row[2]):
-                    return None
-                uid, uname, _, role, p_json = row
-                if role == "USER":
-                    return {"role": "USER", "username": uname}
-                token = secrets.token_urlsafe(48)
-                cur.execute(
-                    "INSERT INTO banka_bot_web_sessions (token, admin_uid, expires_at) VALUES (%s, %s, CURRENT_TIMESTAMP + INTERVAL '7 days');",
-                    (token, int(uid)),
-                )
-                cur.execute("UPDATE banka_bot_web_admins SET last_login_at = CURRENT_TIMESTAMP WHERE admin_uid = %s;", (int(uid),))
-            conn.commit()
-            return {
-                "token": token,
-                "admin_uid": int(uid),
-                "username": uname,
-                "role": role,
-                "permissions": parse_perms(p_json),
-            }
-
-        res = with_db(_op)
-        if not res:
-            self._send_json(401, {"error": "Неверный логин или пароль"})
-            return
-        self._send_json(200, res)
-
-    def _handle_dashboard(self):
-        msk_now = datetime.now(MSK_TZ)
-        today_start_ms = int(datetime(msk_now.year, msk_now.month, msk_now.day, tzinfo=MSK_TZ).timestamp() * 1000)
-        week_start_ms = now_ms() - 7 * 86_400_000
-        month_start_ms = now_ms() - 30 * 86_400_000
-
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                        COALESCE(SUM(CASE WHEN status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s THEN stars_amount ELSE 0 END), 0),
-                        COUNT(CASE WHEN status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s THEN 1 END),
-                        COALESCE(SUM(CASE WHEN status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s THEN stars_amount ELSE 0 END), 0),
-                        COUNT(CASE WHEN status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s THEN 1 END),
-                        COALESCE(SUM(CASE WHEN status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s THEN stars_amount ELSE 0 END), 0),
-                        COUNT(CASE WHEN status_tag = 'PAID' AND COALESCE(paid_ms, created_ms) >= %s THEN 1 END),
-                        COALESCE(SUM(CASE WHEN status_tag = 'PAID' THEN stars_amount ELSE 0 END), 0),
-                        COUNT(CASE WHEN status_tag = 'PAID' THEN 1 END),
-                        COUNT(CASE WHEN status_tag = 'PENDING' THEN 1 END),
-                        COUNT(CASE WHEN status_tag IN ('CANCELLED', 'REFUNDED') THEN 1 END)
-                    FROM banka_stars_orders;
-                    """,
-                    (today_start_ms, today_start_ms, week_start_ms, week_start_ms, month_start_ms, month_start_ms),
-                )
-                s = cur.fetchone()
-                cur.execute("SELECT COUNT(*) FROM banka_bot_users;")
-                bot_cnt = int(cur.fetchone()[0])
-
-                gdz_cnt = 0
-                if _table_exists(cur, "banka_profiles_vault"):
-                    cur.execute("SELECT COUNT(*) FROM banka_profiles_vault;")
-                    gdz_cnt = int(cur.fetchone()[0])
-
-                rooms_cnt, msgs_cnt = 0, 0
-                if _table_exists(cur, "banka_chat_rooms") and _table_exists(cur, "banka_chat_messages"):
-                    cur.execute("SELECT COUNT(*) FROM banka_chat_rooms;")
-                    rooms_cnt = int(cur.fetchone()[0])
-                    cur.execute("SELECT COUNT(*) FROM banka_chat_messages;")
-                    msgs_cnt = int(cur.fetchone()[0])
-
-                cur.execute(
-                    """
-                    SELECT order_uid, buyer_uid, buyer_login, item_kind, plan_days,
-                           coins_amount, target_bg_id, stars_amount, status_tag,
-                           telegram_user_id, COALESCE(paid_ms, created_ms)
-                    FROM banka_stars_orders
-                    ORDER BY order_uid DESC LIMIT 20;
-                    """
-                )
-                recent = [
-                    {
-                        "order_uid": int(r[0]),
-                        "buyer_uid": int(r[1]),
-                        "buyer_login": r[2] or "",
-                        "item_label": _format_item_label(r[3], r[4], r[5], r[6]),
-                        "stars_amount": int(r[7]),
-                        "status_tag": r[8],
-                        "telegram_user_id": int(r[9] or 0),
-                        "created_msk": fmt_msk(r[10]),
-                    }
-                    for r in cur.fetchall()
-                ]
-            return {
-                "stars_today": int(s[0]),
-                "orders_today": int(s[1]),
-                "stars_week": int(s[2]),
-                "orders_week": int(s[3]),
-                "stars_month": int(s[4]),
-                "orders_month": int(s[5]),
-                "stars_all": int(s[6]),
-                "orders_all": int(s[7]),
-                "pending_orders": int(s[8]),
-                "cancelled_orders": int(s[9]),
-                "bot_users_count": bot_cnt,
-                "gdz_users_count": gdz_cnt,
-                "chat_rooms_count": rooms_cnt,
-                "chat_messages_count": msgs_cnt,
-                "recent_orders": recent,
-            }
-
-        self._send_json(200, with_db(_op))
-
-    def _handle_bot_users(self, q: str):
-        like = f"%{q}%"
-
-        def _op(conn):
-            with conn.cursor() as cur:
-                has_vault = _table_exists(cur, "banka_profiles_vault")
-                join_vault = "LEFT JOIN banka_profiles_vault v ON v.rec_uid = b.gdz_user_id" if has_vault else ""
-                vault_cols = "COALESCE(NULLIF(TRIM(v.title_first || ' ' || v.title_last), ''), '') AS gdz_fullname" if has_vault else "'' AS gdz_fullname"
-                where_sql = ""
-                params = []
-                if q:
-                    where_sql = """
-                        WHERE CAST(b.tg_user_id AS TEXT) ILIKE %s
-                           OR b.tg_username ILIKE %s
-                           OR b.tg_first_name ILIKE %s
-                           OR b.tg_last_name ILIKE %s
-                           OR b.gdz_login ILIKE %s
-                    """
-                    params = [like, like, like, like, like]
-                cur.execute(
-                    f"""
-                    SELECT b.tg_user_id, b.tg_username, b.tg_first_name, b.tg_last_name,
-                           b.gdz_user_id, b.gdz_login, {vault_cols},
-                           b.last_seen_at,
-                           COALESCE((SELECT SUM(o.stars_amount) FROM banka_stars_orders o WHERE (o.telegram_user_id = b.tg_user_id OR (b.gdz_user_id > 0 AND o.buyer_uid = b.gdz_user_id)) AND o.status_tag = 'PAID'), 0) AS spent_stars,
-                           COALESCE((SELECT COUNT(*) FROM banka_stars_orders o WHERE (o.telegram_user_id = b.tg_user_id OR (b.gdz_user_id > 0 AND o.buyer_uid = b.gdz_user_id)) AND o.status_tag = 'PAID'), 0) AS paid_cnt
-                    FROM banka_bot_users b
-                    {join_vault}
-                    {where_sql}
-                    ORDER BY b.last_seen_at DESC
-                    LIMIT 200;
-                    """,
-                    params,
-                )
-                return [
-                    {
-                        "tg_user_id": int(r[0]),
-                        "tg_username": r[1] or "",
-                        "tg_first_name": r[2] or "",
-                        "tg_last_name": r[3] or "",
-                        "gdz_user_id": int(r[4] or 0),
-                        "gdz_login": r[5] or "",
-                        "gdz_fullname": r[6] or "",
-                        "last_seen_msk": fmt_msk(r[7]),
-                        "spent_stars": int(r[8]),
-                        "paid_orders_count": int(r[9]),
-                    }
-                    for r in cur.fetchall()
-                ]
-
-        self._send_json(200, {"users": with_db(_op)})
-
-    def _handle_gdz_users(self, q: str):
-        like = f"%{q}%"
-
-        def _op(conn):
-            with conn.cursor() as cur:
-                if not _table_exists(cur, "banka_profiles_vault"):
-                    return []
-                has_chats = _table_exists(cur, "banka_chat_members")
-                chats_expr = "(SELECT COUNT(*) FROM banka_chat_members cm WHERE cm.member_uid = v.rec_uid)" if has_chats else "0"
-                where_sql = ""
-                params = [now_ms()]
-                if q:
-                    where_sql = """
-                        WHERE CAST(v.rec_uid AS TEXT) ILIKE %s
-                           OR v.entry_tag ILIKE %s
-                           OR v.title_first ILIKE %s
-                           OR v.title_last ILIKE %s
-                           OR v.cohort_code ILIKE %s
-                    """
-                    params.extend([like, like, like, like, like])
-                cur.execute(
-                    f"""
-                    SELECT v.rec_uid, v.entry_tag,
-                           TRIM(COALESCE(v.title_first, '') || ' ' || COALESCE(v.title_last, '')),
-                           COALESCE(v.cohort_code, ''),
-                           COALESCE(v.rank_badge, 'STUDENT'),
-                           (COALESCE(v.vip_flag, FALSE) AND (v.premium_until_ms IS NULL OR v.premium_until_ms > %s)),
-                           COALESCE(v.vault_tokens, 0),
-                           {chats_expr} AS chats_cnt,
-                           COALESCE((SELECT SUM(o.stars_amount) FROM banka_stars_orders o WHERE o.buyer_uid = v.rec_uid AND o.status_tag = 'PAID'), 0) AS spent_stars,
-                           COALESCE((SELECT MAX(b.tg_user_id) FROM banka_bot_users b WHERE b.gdz_user_id = v.rec_uid), 0) AS tg_uid
-                    FROM banka_profiles_vault v
-                    {where_sql}
-                    ORDER BY v.rec_uid DESC
-                    LIMIT 250;
-                    """,
-                    params,
-                )
-                return [
-                    {
-                        "rec_uid": int(r[0]),
-                        "login": r[1] or "",
-                        "full_name": (r[2] or "").strip(),
-                        "cohort_code": r[3] or "",
-                        "rank_badge": r[4] or "STUDENT",
-                        "is_vip": bool(r[5]),
-                        "coins": int(r[6]),
-                        "chats_count": int(r[7]),
-                        "spent_stars": int(r[8]),
-                        "tg_user_id": int(r[9] or 0),
-                    }
-                    for r in cur.fetchall()
-                ]
-
-        self._send_json(200, {"users": with_db(_op)})
-
-    def _fetch_orders_and_dms(self, cur, tg_id: int, gdz_uid: int):
-        cur.execute(
-            """
-            SELECT order_uid, pay_code, item_kind, plan_days, coins_amount, target_bg_id,
-                   stars_amount, status_tag, COALESCE(paid_ms, created_ms)
-            FROM banka_stars_orders
-            WHERE (%s > 0 AND telegram_user_id = %s) OR (%s > 0 AND buyer_uid = %s)
-            ORDER BY order_uid DESC
-            LIMIT 100;
-            """,
-            (tg_id, tg_id, gdz_uid, gdz_uid),
-        )
-        orders = [
-            {
-                "order_uid": int(r[0]),
-                "pay_code": r[1],
-                "item_label": _format_item_label(r[2], r[3], r[4], r[5]),
-                "stars_amount": int(r[6]),
-                "status_tag": r[7],
-                "created_msk": fmt_msk(r[8]),
-            }
-            for r in cur.fetchall()
-        ]
-        msgs = []
-        if tg_id > 0:
-            cur.execute(
-                """
-                SELECT sender_admin, message_text, COALESCE(has_photo, FALSE), created_at
-                FROM banka_bot_messages_log
-                WHERE target_tg_id = %s AND target_type = 'DM'
-                ORDER BY log_uid DESC LIMIT 40;
-                """,
-                (tg_id,),
-            )
-            msgs = [
-                {
-                    "sender_admin": r[0],
-                    "message_text": r[1],
-                    "has_photo": bool(r[2]),
-                    "created_msk": fmt_msk(r[3]),
-                }
-                for r in cur.fetchall()
-            ]
-        return orders, msgs
-
-    def _handle_tg_user_detail(self, tg_id: int):
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT gdz_user_id FROM banka_bot_users WHERE tg_user_id = %s LIMIT 1;", (tg_id,))
-                row = cur.fetchone()
-                gdz_uid = int(row[0]) if (row and row[0]) else 0
-                orders, msgs = self._fetch_orders_and_dms(cur, tg_id, gdz_uid)
-                return {"tg_user_id": tg_id, "gdz_user_id": gdz_uid, "orders": orders, "messages": msgs}
-
-        self._send_json(200, with_db(_op))
-
-    def _handle_gdz_user_detail(self, gdz_uid: int):
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT COALESCE(MAX(tg_user_id), 0) FROM banka_bot_users WHERE gdz_user_id = %s;", (gdz_uid,))
-                tg_id = int(cur.fetchone()[0] or 0)
-                orders, msgs = self._fetch_orders_and_dms(cur, tg_id, gdz_uid)
-                return {"tg_user_id": tg_id, "gdz_user_id": gdz_uid, "orders": orders, "messages": msgs}
-
-        self._send_json(200, with_db(_op))
-
-    def _handle_tg_user_chats(self, tg_id: int):
-        def _find_gdz(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT gdz_user_id FROM banka_bot_users WHERE tg_user_id = %s LIMIT 1;", (tg_id,))
-                row = cur.fetchone()
-                return int(row[0]) if (row and row[0]) else 0
-
-        gdz_uid = with_db(_find_gdz)
-        if gdz_uid <= 0:
-            self._send_json(200, {"rooms": []})
-            return
-        self._handle_gdz_user_chats(gdz_uid)
-
-    def _handle_gdz_user_chats(self, gdz_uid: int):
-        def _op(conn):
-            with conn.cursor() as cur:
-                if not (_table_exists(cur, "banka_chat_rooms") and _table_exists(cur, "banka_chat_members") and _table_exists(cur, "banka_chat_messages")):
-                    return []
-                cur.execute(
-                    """
-                    SELECT
-                        r.room_uid,
-                        r.kind_tag,
-                        COALESCE(r.title_txt, ''),
-                        (SELECT COUNT(*) FROM banka_chat_messages m WHERE m.room_uid = r.room_uid) AS msg_cnt,
-                        COALESCE((SELECT MAX(m2.created_stamp) FROM banka_chat_messages m2 WHERE m2.room_uid = r.room_uid), r.updated_stamp) AS last_ts,
-                        COALESCE(NULLIF(TRIM(peer.title_first || ' ' || peer.title_last), ''), peer.entry_tag, '') AS peer_name,
-                        COALESCE(peer.entry_tag, '') AS peer_login
-                    FROM banka_chat_rooms r
-                    JOIN banka_chat_members my_m ON my_m.room_uid = r.room_uid AND my_m.member_uid = %s
-                    LEFT JOIN banka_chat_members pm ON r.kind_tag = 'DIRECT' AND pm.room_uid = r.room_uid AND pm.member_uid <> %s
-                    LEFT JOIN banka_profiles_vault peer ON peer.rec_uid = pm.member_uid
-                    ORDER BY last_ts DESC, r.room_uid DESC
-                    LIMIT 150;
-                    """,
-                    (gdz_uid, gdz_uid),
-                )
-                rooms = []
-                for r in cur.fetchall():
-                    kind = r[1] or "DIRECT"
-                    title = (r[2] or "").strip()
-                    peer_name = (r[5] or "").strip()
-                    peer_login = (r[6] or "").strip()
-                    if kind == "DIRECT":
-                        disp = f"ЛС с {peer_name}" + (f" (@{peer_login})" if peer_login else "") if peer_name else f"Личный чат #{r[0]}"
-                    else:
-                        disp = title or f"Группа #{r[0]}"
-                    rooms.append(
-                        {
-                            "room_uid": int(r[0]),
-                            "kind_tag": kind,
-                            "display_title": disp,
-                            "messages_count": int(r[3]),
-                            "updated_msk": fmt_msk(r[4]),
-                        }
-                    )
-                return rooms
-
-        self._send_json(200, {"rooms": with_db(_op)})
-
-    def _handle_chat_messages(self, room_uid: int):
-        def _op(conn):
-            with conn.cursor() as cur:
-                if not _table_exists(cur, "banka_chat_messages"):
-                    return []
-                cur.execute(
-                    """
-                    SELECT
-                        m.msg_uid,
-                        m.sender_uid,
-                        COALESCE(NULLIF(TRIM(u.title_first || ' ' || u.title_last), ''), u.entry_tag, 'Пользователь') AS sender_name,
-                        COALESCE(u.entry_tag, '') AS sender_login,
-                        m.kind_tag,
-                        COALESCE(m.text_body, ''),
-                        COALESCE(m.reply_sender_name, ''),
-                        COALESCE(m.reply_preview, ''),
-                        COALESCE(m.forwarded_from_name, ''),
-                        COALESCE(m.media_name, ''),
-                        (COALESCE(m.media_b64, '') <> '') AS has_media,
-                        COALESCE(m.voice_sec, 0),
-                        COALESCE(m.shared_mat_title, ''),
-                        COALESCE(m.shared_ai_title, ''),
-                        COALESCE(m.is_edited, FALSE),
-                        COALESCE(m.is_deleted, FALSE),
-                        m.created_stamp
-                    FROM banka_chat_messages m
-                    LEFT JOIN banka_profiles_vault u ON u.rec_uid = m.sender_uid
-                    WHERE m.room_uid = %s
-                    ORDER BY m.msg_uid DESC
-                    LIMIT 250;
-                    """,
-                    (room_uid,),
-                )
-                rows = list(reversed(cur.fetchall()))
-                return [
-                    {
-                        "msg_uid": int(r[0]),
-                        "sender_uid": int(r[1]),
-                        "sender_name": r[2],
-                        "sender_login": r[3],
-                        "kind_tag": r[4],
-                        "text_body": r[5],
-                        "reply_sender_name": r[6],
-                        "reply_preview": r[7],
-                        "forwarded_from_name": r[8],
-                        "media_name": r[9],
-                        "has_media": bool(r[10]),
-                        "voice_sec": int(r[11]),
-                        "shared_mat_title": r[12],
-                        "shared_ai_title": r[13],
-                        "is_edited": bool(r[14]),
-                        "is_deleted": bool(r[15]),
-                        "created_msk": fmt_msk(r[16]),
-                    }
-                    for r in rows
-                ]
-
-        self._send_json(200, {"messages": with_db(_op)})
-
-    def _handle_chat_message_media(self, msg_uid: int):
-        def _op(conn):
-            with conn.cursor() as cur:
-                if not _table_exists(cur, "banka_chat_messages"):
-                    return None
-                cur.execute("SELECT COALESCE(media_b64, '') FROM banka_chat_messages WHERE msg_uid = %s LIMIT 1;", (msg_uid,))
-                row = cur.fetchone()
-                return row[0] if (row and row[0]) else None
-
-        b64 = with_db(_op)
-        if not b64:
-            self._send_json(404, {"error": "Фото отсутствует"})
-            return
-        self._send_json(200, {"media_b64": b64})
-
-    def _handle_dm(self, admin: dict, body: dict):
-        try:
-            tg_id = int(body.get("tg_user_id", 0))
-        except Exception:
-            tg_id = 0
-        text = str(body.get("text", "")).strip()
-        raw_photo = str(body.get("photo_b64", "")).strip()
-        if tg_id <= 0 or (not text and not raw_photo):
-            self._send_json(400, {"error": "Укажите получателя и текст или фото"})
-            return
-        try:
-            photo_bytes, photo_name = parse_image_data_url(raw_photo)
-        except ValueError as e:
-            self._send_json(400, {"error": str(e)})
-            return
-
-        try:
-            send_telegram_content(tg_id, text, photo_bytes, photo_name)
-        except Exception as e:
-            self._send_json(400, {"error": f"Telegram отклонил отправку: {e}"})
-            return
-
-        with_db(lambda conn: (
-            conn.cursor().execute(
-                """
-                INSERT INTO banka_bot_messages_log (sender_admin, target_type, target_tg_id, message_text, has_photo, sent_count, failed_count)
-                VALUES (%s, 'DM', %s, %s, %s, 1, 0);
-                """,
-                (admin["username"], tg_id, text, bool(photo_bytes)),
-            ),
-            conn.commit(),
-        ))
-        self._send_json(200, {"ok": True})
-
-    def _handle_broadcast(self, admin: dict, body: dict):
-        audience = str(body.get("audience", "all")).strip()
-        text = str(body.get("text", "")).strip()
-        raw_photo = str(body.get("photo_b64", "")).strip()
-        if not text and not raw_photo:
-            self._send_json(400, {"error": "Добавьте текст или фото для рассылки"})
-            return
-        try:
-            photo_bytes, photo_name = parse_image_data_url(raw_photo)
-        except ValueError as e:
-            self._send_json(400, {"error": str(e)})
-            return
-
-        def _get_targets(conn):
-            with conn.cursor() as cur:
-                if audience == "linked":
-                    cur.execute("SELECT tg_user_id FROM banka_bot_users WHERE COALESCE(is_blocked, FALSE) = FALSE AND gdz_user_id > 0;")
-                elif audience == "buyers":
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT tg_user_id FROM banka_bot_users ORDER BY last_seen_ms DESC;")
+                    targets = [int(r["tg_user_id"]) for r in cur.fetchall()]
+            sent = 0
+            failed = 0
+            for tid in targets:
+                try:
+                    bot.send_message(tid, text[:4000])
+                    sent += 1
+                except Exception:
+                    failed += 1
+                time.sleep(0.05)
+            with db_connect() as conn:
+                with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT DISTINCT b.tg_user_id
-                        FROM banka_bot_users b
-                        JOIN banka_stars_orders o ON o.telegram_user_id = b.tg_user_id
-                        WHERE COALESCE(b.is_blocked, FALSE) = FALSE AND o.status_tag = 'PAID';
-                        """
+                        INSERT INTO banka_bot_messages_log (
+                            sender_web_uid, sender_login, kind, target_tg_user_id,
+                            message_text, sent_count, failed_count, created_ms
+                        )
+                        VALUES (%s, %s, 'BROADCAST', 0, %s, %s, %s, %s);
+                        """,
+                        (user["web_uid"], user["login"], text[:4000], sent, failed, now_ms()),
                     )
-                else:
-                    cur.execute("SELECT tg_user_id FROM banka_bot_users WHERE COALESCE(is_blocked, FALSE) = FALSE;")
-                return [int(r[0]) for r in cur.fetchall()]
+            self._send_json(200, {"sent": sent, "failed": failed})
+            return
 
-        targets = with_db(_get_targets)
-        sent_ok = 0
-        failed = 0
-        cached_file_id = None
-        blocked_ids = []
-
-        for tid in targets:
+        if path == "/api/admins/role":
+            user = self._require_perm(None)
+            if not user:
+                return
+            if user["role"] != ROLE_SUPER_ADMIN:
+                self._send_json(403, {"error": "Только Супер-Администратор может менять роли"})
+                return
             try:
-                cached_file_id = send_telegram_content(tid, text, photo_bytes, photo_name, cached_file_id=cached_file_id)
-                sent_ok += 1
-            except Exception as exc:
-                failed += 1
-                msg_low = str(exc).lower()
-                if "blocked" in msg_low or "deactivated" in msg_low or "chat not found" in msg_low:
-                    blocked_ids.append(tid)
-            time.sleep(0.04)
-
-        def _log_bc(conn):
-            with conn.cursor() as cur:
-                if blocked_ids:
+                target_uid = int(body.get("web_uid") or 0)
+            except Exception:
+                target_uid = 0
+            new_role = str(body.get("role") or ROLE_USER).upper()
+            if new_role not in (ROLE_USER, ROLE_MODERATOR):
+                self._send_json(400, {"error": "Допустимы только роли USER и MODERATOR"})
+                return
+            if target_uid == user["web_uid"]:
+                self._send_json(400, {"error": "Нельзя изменить собственную роль Супер-Администратора"})
+                return
+            perms = safe_json_dict(body.get("permissions")) if new_role == ROLE_MODERATOR else {}
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT role FROM banka_bot_web_admins WHERE web_uid = %s;", (target_uid,))
+                    target = cur.fetchone()
+                    if not target:
+                        self._send_json(404, {"error": "Аккаунт не найден"})
+                        return
+                    if target["role"] == ROLE_SUPER_ADMIN:
+                        self._send_json(400, {"error": "Нельзя менять роль Супер-Администратора"})
+                        return
                     cur.execute(
-                        "UPDATE banka_bot_users SET is_blocked = TRUE WHERE tg_user_id = ANY(%s);",
-                        (blocked_ids,),
+                        "UPDATE banka_bot_web_admins SET role = %s, perms_json = %s WHERE web_uid = %s;",
+                        (new_role, json.dumps(perms), target_uid),
                     )
-                cur.execute(
-                    """
-                    INSERT INTO banka_bot_messages_log (sender_admin, target_type, target_tg_id, message_text, has_photo, sent_count, failed_count)
-                    VALUES (%s, %s, 0, %s, %s, %s, %s);
-                    """,
-                    (admin["username"], f"BROADCAST:{audience}", text, bool(photo_bytes), sent_ok, failed),
-                )
-            conn.commit()
-
-        with_db(_log_bc)
-        self._send_json(200, {"ok": True, "sent": sent_ok, "failed": failed, "total": len(targets), "has_photo": bool(photo_bytes)})
-
-    def _handle_list_moderators(self):
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT admin_uid, username, role, permissions_json, created_at FROM banka_bot_web_admins ORDER BY admin_uid ASC;")
-                return [
-                    {
-                        "admin_uid": int(r[0]),
-                        "username": r[1],
-                        "role": r[2],
-                        "permissions": parse_perms(r[3]),
-                        "created_msk": fmt_msk(r[4]),
-                    }
-                    for r in cur.fetchall()
-                ]
-
-        self._send_json(
-            200,
-            {
-                "admins": with_db(_op),
-                "all_permissions": [{"key": k, "label": lbl} for k, lbl in ALL_PERMISSIONS],
-            },
-        )
-
-    def _handle_set_mod_role(self, actor: dict, body: dict):
-        uid = int(body.get("admin_uid", 0))
-        role = str(body.get("role", "USER")).upper()
-        if role not in ("USER", "MODERATOR"):
-            self._send_json(400, {"error": "Допустимы только роли USER и MODERATOR"})
-            return
-        if uid == actor["admin_uid"]:
-            self._send_json(400, {"error": "Нельзя изменить собственную роль"})
+            self._send_json(200, {"ok": True})
             return
 
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute("UPDATE banka_bot_web_admins SET role = %s WHERE admin_uid = %s AND role <> 'SUPER_ADMIN';", (role, uid))
-                if role == "USER":
-                    cur.execute("DELETE FROM banka_bot_web_sessions WHERE admin_uid = %s;", (uid,))
-            conn.commit()
-
-        with_db(_op)
-        self._send_json(200, {"ok": True})
-
-    def _handle_set_mod_perms(self, body: dict):
-        uid = int(body.get("admin_uid", 0))
-        perms = [str(p) for p in (body.get("permissions") or []) if str(p) in PERM_KEYS]
-        with_db(lambda conn: (
-            conn.cursor().execute(
-                "UPDATE banka_bot_web_admins SET permissions_json = %s WHERE admin_uid = %s AND role = 'MODERATOR';",
-                (json.dumps(perms), uid),
-            ),
-            conn.commit(),
-        ))
-        self._send_json(200, {"ok": True})
+        self._send_json(404, {"error": "Не найдено"})
 
 
-def _format_item_label(kind: str, days: int, coins: int, bg_id: int) -> str:
-    k = str(kind or "").upper()
-    if k == "PREMIUM":
-        return f"Premium ({days} дн.)"
-    if k == "COINS":
-        return f"Монеты (+{coins})"
-    if k == "BACKGROUND":
-        return f"Фон профиля #{bg_id}"
-    return k or "Заказ"
-
-
-class ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-def run_bot_polling():
-    while True:
-        try:
-            ensure_db_ready()
-            bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=False)
-        except Exception as e:
-            print(f"[BOT POLLING ERROR] {e}", flush=True)
-            time.sleep(3)
-
-
-def main():
-    # Сначала открываем порт для Render, чтобы не было 502 на старте
-    server = ReusableThreadingHTTPServer(("0.0.0.0", PORT), AdminHttpHandler)
-    print(f"GDZgo Bot & Admin server listening on 0.0.0.0:{PORT}", flush=True)
-
-    threading.Thread(target=init_db_background, daemon=True).start()
-    threading.Thread(target=cancelled_invoice_watcher, daemon=True).start()
-    threading.Thread(target=run_bot_polling, daemon=True).start()
-
+def start_web_server() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), PortalHandler)
     server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    init_bot_tables()
+    threading.Thread(target=cancelled_invoice_watcher, daemon=True).start()
+    threading.Thread(target=start_web_server, daemon=True).start()
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=False)
+        except Exception as err:
+            print(f"Polling error: {err}")
+            time.sleep(3)
