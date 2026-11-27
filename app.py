@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     from zoneinfo import ZoneInfo
@@ -25,15 +25,32 @@ from telebot import types
 # КОНФИГУРАЦИЯ (Переменные окружения Render)
 # ============================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+RAW_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
-if not DATABASE_URL:
+if not RAW_DATABASE_URL:
     raise RuntimeError("Не задана переменная окружения DATABASE_URL")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+
+def normalize_db_url(url: str) -> str:
+    u = url.strip()
+    if u.startswith("postgres://"):
+        u = "postgresql://" + u[len("postgres://"):]
+    parsed = urlparse(u)
+    host = (parsed.hostname or "").lower()
+    if host not in ("localhost", "127.0.0.1", "::1") and "sslmode=" not in (parsed.query or "").lower():
+        sep = "&" if parsed.query else "?"
+        u = f"{u}{sep}sslmode=require"
+    return u
+
+
+DATABASE_URL = normalize_db_url(RAW_DATABASE_URL)
+
+telebot.apihelper.CONNECT_TIMEOUT = 10
+telebot.apihelper.READ_TIMEOUT = 30
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, threaded=True)
 
 ALL_PERMISSIONS = [
     ("view_dashboard", "Статистика и доходы"),
@@ -45,8 +62,11 @@ ALL_PERMISSIONS = [
 PERM_KEYS = {k for k, _ in ALL_PERMISSIONS}
 
 REFERRAL_PREMIUM_BONUS_COINS = 30
-MAX_JSON_BODY_BYTES = 8_000_000  # ~5.5 МБ сырого фото в base64 + метаданные
+MAX_JSON_BODY_BYTES = 8_000_000
 MAX_PHOTO_RAW_BYTES = 5_500_000
+
+_db_init_lock = threading.Lock()
+_db_initialized = False
 
 
 def now_ms() -> int:
@@ -76,7 +96,33 @@ def fmt_msk(ts_val) -> str:
 
 
 def get_conn():
-    return psycopg.connect(DATABASE_URL, autocommit=False)
+    return psycopg.connect(
+        DATABASE_URL,
+        autocommit=False,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+
+
+def with_db(fn, retries: int = 2):
+    ensure_db_ready()
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with get_conn() as conn:
+                res = fn(conn)
+                return res
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            last_err = exc
+            if attempt + 1 < retries:
+                time.sleep(0.25)
+                continue
+            raise
+    if last_err:
+        raise last_err
 
 
 def _table_exists(cur, table_name: str) -> bool:
@@ -88,7 +134,6 @@ def _table_exists(cur, table_name: str) -> bool:
 def init_bot_tables():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. Пользователи Telegram-бота
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_bot_users (
@@ -113,7 +158,6 @@ def init_bot_tables():
             cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
             cur.execute("ALTER TABLE banka_bot_users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
 
-            # 2. На случай запуска на пустой БД до старта Android-приложения
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_stars_orders (
@@ -137,7 +181,6 @@ def init_bot_tables():
                 """
             )
 
-            # 3. Отслеживание отправленных счетов Stars (с безопасной миграцией старой таблицы)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_stars_invoices (
@@ -165,7 +208,6 @@ def init_bot_tables():
                 """
             )
 
-            # 4. Веб-пользователи / Админы / Модераторы
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_bot_web_admins (
@@ -183,7 +225,6 @@ def init_bot_tables():
             cur.execute("ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS permissions_json TEXT NOT NULL DEFAULT '[]';")
             cur.execute("ALTER TABLE banka_bot_web_admins ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP NULL;")
 
-            # 5. Сессии веб-панели
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_bot_web_sessions (
@@ -197,7 +238,6 @@ def init_bot_tables():
             cur.execute("ALTER TABLE banka_bot_web_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '7 days');")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_banka_bot_web_sessions_exp ON banka_bot_web_sessions (expires_at);")
 
-            # 6. Журнал сообщений и рассылок
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS banka_bot_messages_log (
@@ -217,8 +257,30 @@ def init_bot_tables():
         conn.commit()
 
 
+def ensure_db_ready():
+    global _db_initialized
+    if _db_initialized:
+        return
+    with _db_init_lock:
+        if _db_initialized:
+            return
+        init_bot_tables()
+        _db_initialized = True
+
+
+def init_db_background():
+    while not _db_initialized:
+        try:
+            ensure_db_ready()
+            print("Database initialized successfully", flush=True)
+            return
+        except Exception as e:
+            print(f"[DB INIT RETRY] {e}", flush=True)
+            time.sleep(3)
+
+
 # ============================================================
-# БЕЗОПАСНОСТЬ ВЕБ-АДМИНКИ (scrypt + Bearer token в памяти)
+# БЕЗОПАСНОСТЬ ВЕБ-АДМИНКИ (scrypt + pbkdf2_sha256 из Android)
 # ============================================================
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -229,12 +291,18 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, stored: str) -> bool:
     try:
         parts = stored.split("$")
-        if len(parts) != 3 or parts[0] != "scrypt":
+        if len(parts) != 3:
             return False
-        salt = bytes.fromhex(parts[1])
-        expected = bytes.fromhex(parts[2])
-        dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
-        return hmac.compare_digest(dk, expected)
+        algo, salt_hex, dk_hex = parts
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(dk_hex)
+        if algo == "scrypt":
+            dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
+            return hmac.compare_digest(dk, expected)
+        if algo == "pbkdf2_sha256":
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000, dklen=32)
+            return hmac.compare_digest(dk, expected)
+        return False
     except Exception:
         return False
 
@@ -264,10 +332,6 @@ def user_has_perm(admin_row: dict, perm: str) -> bool:
 # ДЕКОДИРОВАНИЕ И ПРОВЕРКА ФОТО ДЛЯ РАССЫЛКИ / ЛС
 # ============================================================
 def parse_image_data_url(raw_data: str):
-    """
-    Принимает data:image/...;base64,... или чистый base64.
-    Возвращает (bytes, filename) или бросает ValueError.
-    """
     if not raw_data:
         return None, ""
     s = str(raw_data).strip()
@@ -296,7 +360,6 @@ def parse_image_data_url(raw_data: str):
         raise ValueError("Пустой файл изображения")
     if len(raw_bytes) > MAX_PHOTO_RAW_BYTES:
         raise ValueError("Изображение больше 5.5 МБ")
-    # Проверка сигнатуры файла
     if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
         ext = "png"
     elif raw_bytes.startswith(b"\xff\xd8\xff"):
@@ -311,10 +374,6 @@ def parse_image_data_url(raw_data: str):
 
 
 def send_telegram_content(chat_id: int, text: str, photo_bytes: bytes | None, photo_name: str, cached_file_id: str | None = None):
-    """
-    Отправляет либо текст, либо фото + текст.
-    Возвращает cached_file_id (обновлённый из первого успешного send_photo) для повторной быстрой рассылки.
-    """
     clean_text = (text or "").strip()
     if photo_bytes is None and not cached_file_id:
         bot.send_message(chat_id, clean_text[:4000])
@@ -343,7 +402,8 @@ def send_telegram_content(chat_id: int, text: str, photo_bytes: bytes | None, ph
 def upsert_tg_user(tg_user, gdz_uid: int | None = None, gdz_login: str | None = None):
     if not tg_user:
         return
-    with get_conn() as conn:
+
+    def _op(conn):
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -372,9 +432,11 @@ def upsert_tg_user(tg_user, gdz_uid: int | None = None, gdz_login: str | None = 
             )
         conn.commit()
 
+    with_db(_op)
+
 
 def get_linked_gdz_account(tg_user_id: int):
-    with get_conn() as conn:
+    def _op(conn):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT gdz_user_id, gdz_login FROM banka_bot_users WHERE tg_user_id = %s LIMIT 1;",
@@ -402,6 +464,8 @@ def get_linked_gdz_account(tg_user_id: int):
                 return None
             return {"id": int(u[0]), "login": u[1], "name": u[2], "coins": int(u[3]), "is_vip": bool(u[4])}
 
+    return with_db(_op)
+
 
 def fetch_shop_config() -> dict:
     cfg = {
@@ -411,10 +475,10 @@ def fetch_shop_config() -> dict:
         "prem_discount_pct": 0,
     }
     try:
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 if not _table_exists(cur, "banka_system_config"):
-                    return cfg
+                    return None
                 cur.execute(
                     """
                     SELECT COALESCE(stars_10d_price, 75),
@@ -424,12 +488,14 @@ def fetch_shop_config() -> dict:
                     FROM banka_system_config WHERE cfg_uid = 1 LIMIT 1;
                     """
                 )
-                row = cur.fetchone()
-                if row:
-                    cfg["stars_10d_price"] = max(1, int(row[0]))
-                    cfg["stars_30d_price"] = max(1, int(row[1]))
-                    cfg["coins_per_star"] = max(0.1, float(row[2]))
-                    cfg["prem_discount_pct"] = max(0, min(90, int(row[3])))
+                return cur.fetchone()
+
+        row = with_db(_op)
+        if row:
+            cfg["stars_10d_price"] = max(1, int(row[0]))
+            cfg["stars_30d_price"] = max(1, int(row[1]))
+            cfg["coins_per_star"] = max(0.1, float(row[2]))
+            cfg["prem_discount_pct"] = max(0, min(90, int(row[3])))
     except Exception:
         pass
     return cfg
@@ -448,7 +514,8 @@ def gen_pay_code() -> str:
 
 def create_bot_stars_order(tg_user_id: int, buyer_uid: int, buyer_login: str, item_kind: str, plan_days: int, coins_amount: int, target_bg_id: int, stars_amount: int):
     cur_ms = now_ms()
-    with get_conn() as conn:
+
+    def _op(conn):
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -488,7 +555,9 @@ def create_bot_stars_order(tg_user_id: int, buyer_uid: int, buyer_login: str, it
                 if row:
                     conn.commit()
                     return int(row[0]), str(row[1])
-            raise RuntimeError("Не удалось создать код оплаты")
+        raise RuntimeError("Не удалось создать код оплаты")
+
+    return with_db(_op)
 
 
 def send_stars_invoice_for_order(chat_id: int, order_row: dict):
@@ -511,7 +580,7 @@ def send_stars_invoice_for_order(chat_id: int, order_row: dict):
     elif item_kind == "BACKGROUND":
         title = f"Фон «{bg_title or 'GDZgo'}»"
         desc = f"Покупка фона профиля в GDZgo для {order_row.get('buyer_login') or ''}".strip()
-        label = f"Фон профиля"
+        label = "Фон профиля"
     else:
         title = "Покупка GDZgo"
         desc = "Оплата через Telegram Stars"
@@ -526,13 +595,13 @@ def send_stars_invoice_for_order(chat_id: int, order_row: dict):
         title=title[:32],
         description=desc[:255],
         invoice_payload=f"gdz_order:{order_uid}:{pay_code}",
-        provider_token="",  # Пусто для Telegram Stars (XTR)
+        provider_token="",
         currency="XTR",
         prices=[types.LabeledPrice(label=label[:32], amount=stars_amount)],
         reply_markup=kb,
     )
 
-    with get_conn() as conn:
+    def _op(conn):
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -544,9 +613,11 @@ def send_stars_invoice_for_order(chat_id: int, order_row: dict):
             )
         conn.commit()
 
+    with_db(_op)
+
 
 def mark_invoices_cleaned(order_uid: int, except_delete: bool = False):
-    with get_conn() as conn:
+    def _op(conn):
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -562,6 +633,9 @@ def mark_invoices_cleaned(order_uid: int, except_delete: bool = False):
                 (order_uid,),
             )
         conn.commit()
+        return rows
+
+    rows = with_db(_op)
     if not except_delete:
         for cid, mid in rows:
             try:
@@ -591,7 +665,8 @@ def handle_start(message):
     parts = (message.text or "").strip().split(maxsplit=1)
     if len(parts) == 2 and parts[1].startswith("pay_"):
         pay_code = parts[1][4:].strip().upper()
-        with get_conn() as conn:
+
+        def _fetch_order(conn):
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -603,28 +678,31 @@ def handle_start(message):
                     (pay_code,),
                 )
                 row = cur.fetchone()
-                if not row:
-                    bot.send_message(message.chat.id, "❌ Счёт с таким кодом не найден.")
-                    return
-                if row[9] == "PAID":
-                    bot.send_message(message.chat.id, "✅ Этот заказ уже оплачен!")
-                    return
-                if row[9] != "PENDING":
-                    bot.send_message(message.chat.id, "⚠️ Этот счёт был отменён в приложении.")
-                    return
-
+                if not row or row[9] != "PENDING":
+                    return row, ""
                 bg_title = ""
                 if int(row[7] or 0) > 0 and _table_exists(cur, "banka_shop_backgrounds"):
                     cur.execute("SELECT title_txt FROM banka_shop_backgrounds WHERE bg_uid = %s LIMIT 1;", (int(row[7]),))
                     b = cur.fetchone()
                     if b:
                         bg_title = b[0]
-
                 cur.execute(
                     "UPDATE banka_stars_orders SET telegram_user_id = %s WHERE order_uid = %s;",
                     (int(message.from_user.id), int(row[0])),
                 )
             conn.commit()
+            return row, bg_title
+
+        row, bg_title = with_db(_fetch_order)
+        if not row:
+            bot.send_message(message.chat.id, "❌ Счёт с таким кодом не найден.")
+            return
+        if row[9] == "PAID":
+            bot.send_message(message.chat.id, "✅ Этот заказ уже оплачен!")
+            return
+        if row[9] != "PENDING":
+            bot.send_message(message.chat.id, "⚠️ Этот счёт был отменён в приложении.")
+            return
 
         upsert_tg_user(message.from_user, gdz_uid=int(row[2]), gdz_login=row[3])
         send_stars_invoice_for_order(
@@ -675,11 +753,11 @@ def handle_link_cmd(message):
         return
     login_arg = parts[1].strip()
     code_arg = parts[2].strip().upper()
-    with get_conn() as conn:
+
+    def _op(conn):
         with conn.cursor() as cur:
             if not _table_exists(cur, "banka_profiles_vault"):
-                bot.send_message(message.chat.id, "❌ База пользователей ещё не инициализирована.")
-                return
+                return "no_table", None
             cur.execute(
                 """
                 SELECT rec_uid, entry_tag,
@@ -690,10 +768,15 @@ def handle_link_cmd(message):
                 """,
                 (login_arg, code_arg),
             )
-            u = cur.fetchone()
-            if not u:
-                bot.send_message(message.chat.id, "❌ Неверный логин или код защиты.")
-                return
+            return "ok", cur.fetchone()
+
+    st, u = with_db(_op)
+    if st == "no_table":
+        bot.send_message(message.chat.id, "❌ База пользователей ещё не инициализирована.")
+        return
+    if not u:
+        bot.send_message(message.chat.id, "❌ Неверный логин или код защиты.")
+        return
     upsert_tg_user(message.from_user, gdz_uid=int(u[0]), gdz_login=u[1])
     acc = get_linked_gdz_account(message.from_user.id)
     bot.send_message(
@@ -714,13 +797,16 @@ def handle_callbacks(call):
         except Exception:
             bot.answer_callback_query(call.id, "Некорректный заказ")
             return
-        with get_conn() as conn:
+
+        def _cancel(conn):
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE banka_stars_orders SET status_tag = 'CANCELLED' WHERE order_uid = %s AND status_tag = 'PENDING';",
                     (oid,),
                 )
             conn.commit()
+
+        with_db(_cancel)
         mark_invoices_cleaned(oid, except_delete=False)
         bot.answer_callback_query(call.id, "Счёт отменён")
         return
@@ -806,25 +892,28 @@ def handle_callbacks(call):
     if data == "menu:bgs":
         bot.answer_callback_query(call.id)
         cur_ms = now_ms()
-        bgs = []
-        with get_conn() as conn:
+
+        def _fetch_bgs(conn):
             with conn.cursor() as cur:
-                if _table_exists(cur, "banka_shop_backgrounds"):
-                    cur.execute(
-                        """
-                        SELECT bg_uid, title_txt, COALESCE(price_stars, 0), COALESCE(discount_pct, 0)
-                        FROM banka_shop_backgrounds
-                        WHERE COALESCE(is_active, TRUE) = TRUE
-                          AND COALESCE(price_stars, 0) > 0
-                          AND (publish_at_ms IS NULL OR publish_at_ms <= %s)
-                          AND (expires_ms IS NULL OR expires_ms > %s)
-                          AND (max_qty IS NULL OR COALESCE(sold_count, 0) < max_qty)
-                        ORDER BY bg_uid DESC
-                        LIMIT 20;
-                        """,
-                        (cur_ms, cur_ms),
-                    )
-                    bgs = cur.fetchall()
+                if not _table_exists(cur, "banka_shop_backgrounds"):
+                    return []
+                cur.execute(
+                    """
+                    SELECT bg_uid, title_txt, COALESCE(price_stars, 0), COALESCE(discount_pct, 0)
+                    FROM banka_shop_backgrounds
+                    WHERE COALESCE(is_active, TRUE) = TRUE
+                      AND COALESCE(price_stars, 0) > 0
+                      AND (publish_at_ms IS NULL OR publish_at_ms <= %s)
+                      AND (expires_ms IS NULL OR expires_ms > %s)
+                      AND (max_qty IS NULL OR COALESCE(sold_count, 0) < max_qty)
+                    ORDER BY bg_uid DESC
+                    LIMIT 20;
+                    """,
+                    (cur_ms, cur_ms),
+                )
+                return cur.fetchall()
+
+        bgs = with_db(_fetch_bgs)
         kb = types.InlineKeyboardMarkup(row_width=1)
         if not bgs:
             kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu:home"))
@@ -870,7 +959,8 @@ def handle_callbacks(call):
     if data.startswith("buy_bg:"):
         bg_id = int(data.split(":", 1)[1])
         cur_ms = now_ms()
-        with get_conn() as conn:
+
+        def _fetch_bg(conn):
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -886,7 +976,9 @@ def handle_callbacks(call):
                     """,
                     (bg_id, cur_ms, cur_ms),
                 )
-                row = cur.fetchone()
+                return cur.fetchone()
+
+        row = with_db(_fetch_bg)
         if not row:
             bot.answer_callback_query(call.id, "Фон больше недоступен для покупки", show_alert=True)
             return
@@ -912,7 +1004,7 @@ def handle_pre_checkout(pre_checkout_query):
         bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Ошибка данных счёта.")
         return
 
-    with get_conn() as conn:
+    def _check(conn):
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -925,15 +1017,12 @@ def handle_pre_checkout(pre_checkout_query):
             )
             row = cur.fetchone()
             if not row:
-                bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Заказ не найден.")
-                return
+                return False, "Заказ не найден."
             status_tag, stars_amount, item_kind, target_bg_id, buyer_uid = row
             if status_tag != "PENDING":
-                bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Этот счёт уже отменён или оплачен.")
-                return
+                return False, "Этот счёт уже отменён или оплачен."
             if int(stars_amount) != int(pre_checkout_query.total_amount):
-                bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Сумма заказа изменилась.")
-                return
+                return False, "Сумма заказа изменилась."
             if str(item_kind).upper() == "BACKGROUND" and int(target_bg_id or 0) > 0:
                 if _table_exists(cur, "banka_user_backgrounds"):
                     cur.execute(
@@ -941,8 +1030,7 @@ def handle_pre_checkout(pre_checkout_query):
                         (int(buyer_uid), int(target_bg_id)),
                     )
                     if cur.fetchone():
-                        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Этот фон уже есть в вашем профиле.")
-                        return
+                        return False, "Этот фон уже есть в вашем профиле."
                 if _table_exists(cur, "banka_shop_backgrounds"):
                     cur.execute(
                         """
@@ -957,10 +1045,11 @@ def handle_pre_checkout(pre_checkout_query):
                         (int(target_bg_id), now_ms(), now_ms()),
                     )
                     if not cur.fetchone():
-                        bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Товар распродан или скрыт.")
-                        return
+                        return False, "Товар распродан или скрыт."
+            return True, ""
 
-    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    ok, err_msg = with_db(_check)
+    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=ok, error_message=err_msg if not ok else None)
 
 
 @bot.message_handler(content_types=["successful_payment"])
@@ -977,10 +1066,11 @@ def handle_successful_payment(message):
         return
 
     cur_ms = now_ms()
-    should_refund = False
-    summary_text = "✅ Оплата получена!"
 
-    with get_conn() as conn:
+    def _apply_payment(conn):
+        should_refund = False
+        already_done = False
+        summary_text = "✅ Оплата получена!"
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -998,9 +1088,8 @@ def handle_successful_payment(message):
             else:
                 _, buyer_uid, buyer_login, item_kind, plan_days, coins_amount, target_bg_id, stars_amount, status_tag, existing_charge = row
                 if existing_charge == charge_id and status_tag == "PAID":
-                    conn.commit()
-                    return
-                if status_tag != "PENDING":
+                    already_done = True
+                elif status_tag != "PENDING":
                     should_refund = True
                 else:
                     cur.execute(
@@ -1019,12 +1108,12 @@ def handle_successful_payment(message):
                         days = max(1, int(plan_days or 30))
                         add_ms = days * 86_400_000
                         cur.execute(
-                            "SELECT vip_flag, premium_until_ms, referred_by_uid, entry_tag, title_first, title_last FROM banka_profiles_vault WHERE rec_uid = %s FOR UPDATE;",
+                            "SELECT vip_flag, premium_until_ms, referred_by_uid FROM banka_profiles_vault WHERE rec_uid = %s FOR UPDATE;",
                             (buyer_uid,),
                         )
                         u = cur.fetchone()
                         if u:
-                            vip_flag, until_ms, ref_by, e_tag, fn, ln = u
+                            vip_flag, until_ms, ref_by = u
                             if not (bool(vip_flag) and until_ms is None):
                                 base_ms = max(cur_ms, int(until_ms or 0))
                                 new_until = base_ms + add_ms
@@ -1093,17 +1182,16 @@ def handle_successful_payment(message):
                                 )
                         summary_text = f"🖼 Фон профиля открыт для @{buyer_login}!"
         conn.commit()
+        return already_done, should_refund, summary_text
+
+    already_done, should_refund, summary_text = with_db(_apply_payment)
+    if already_done:
+        return
 
     if should_refund:
         try:
             bot.refund_star_payment(tg_id, charge_id)
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE banka_stars_orders SET status_tag = 'REFUNDED' WHERE order_uid = %s;",
-                        (oid,),
-                    )
-                conn.commit()
+            with_db(lambda conn: (conn.cursor().execute("UPDATE banka_stars_orders SET status_tag = 'REFUNDED' WHERE order_uid = %s;", (oid,)), conn.commit()))
             bot.send_message(message.chat.id, "↩️ Заказ уже был отменён ранее — звёзды автоматически возвращены на ваш баланс Telegram.")
         except Exception as e:
             bot.send_message(message.chat.id, f"⚠️ Заказ был отменён. Ошибка автовозврата: {e}")
@@ -1117,41 +1205,41 @@ def handle_successful_payment(message):
 def cancelled_invoice_watcher():
     while True:
         try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT i.order_uid, i.chat_id, i.message_id
-                        FROM banka_stars_invoices i
-                        JOIN banka_stars_orders o ON o.order_uid = i.order_uid
-                        WHERE COALESCE(i.cleaned_flag, FALSE) = FALSE
-                          AND o.status_tag <> 'PENDING'
-                        LIMIT 25;
-                        """
-                    )
-                    rows = cur.fetchall()
+            if _db_initialized:
+                def _poll(conn):
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT i.order_uid, i.chat_id, i.message_id
+                            FROM banka_stars_invoices i
+                            JOIN banka_stars_orders o ON o.order_uid = i.order_uid
+                            WHERE COALESCE(i.cleaned_flag, FALSE) = FALSE
+                              AND o.status_tag <> 'PENDING'
+                            LIMIT 25;
+                            """
+                        )
+                        return cur.fetchall()
+
+                rows = with_db(_poll)
                 for oid, cid, mid in rows:
                     try:
                         bot.delete_message(int(cid), int(mid))
                     except Exception:
                         pass
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE banka_stars_invoices
-                            SET cleaned_flag = TRUE
-                            WHERE order_uid = %s AND chat_id = %s AND message_id = %s;
-                            """,
+                    with_db(lambda conn: (
+                        conn.cursor().execute(
+                            "UPDATE banka_stars_invoices SET cleaned_flag = TRUE WHERE order_uid = %s AND chat_id = %s AND message_id = %s;",
                             (int(oid), int(cid), int(mid)),
-                        )
-                    conn.commit()
+                        ),
+                        conn.commit(),
+                    ))
         except Exception:
             pass
-        time.sleep(2.0)
+        time.sleep(2.5)
 
 
 # ============================================================
-# HTML-ИНТЕРФЕЙСЫ (БЕЗОПАСНЫЙ DOM БЕЗ innerHTML ДЛЯ ДАННЫХ)
+# HTML-ИНТЕРФЕЙСЫ (БЕЗОПАСНЫЙ DOM + АВТОПОВТОР ЗАПРОСОВ)
 # ============================================================
 PUBLIC_HTML = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -1183,7 +1271,7 @@ PUBLIC_HTML = r"""<!DOCTYPE html>
 <body>
 <div class="card">
   <h1>GDZgo Bot Portal</h1>
-  <p class="sub">Первый зарегистрированный аккаунт становится Супер-администратором.</p>
+  <p class="sub">Первый зарегистрированный аккаунт становится Супер-администратором (логин и пароль также можно обновить в приложении GDZgo в Спец.действиях).</p>
   <div class="tabs">
     <button class="tab active" id="tabLogin" type="button">Вход</button>
     <button class="tab" id="tabReg" type="button">Регистрация</button>
@@ -1219,6 +1307,32 @@ function setMode(m) {
 tabLogin.onclick = () => setMode("login");
 tabReg.onclick = () => setMode("register");
 
+async function safePost(url, payload) {
+  for (let i = 0; i < 2; i++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const txt = await res.text();
+      let data = {};
+      try { data = JSON.parse(txt); } catch (_) {}
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && i === 0) {
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      return { ok: res.ok, status: res.status, data, raw: txt };
+    } catch (e) {
+      if (i === 0) {
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 document.getElementById("authForm").onsubmit = async (e) => {
   e.preventDefault();
   statusBox.className = "msg";
@@ -1227,28 +1341,23 @@ document.getElementById("authForm").onsubmit = async (e) => {
   const u = document.getElementById("username").value.trim();
   const p = document.getElementById("password").value;
   try {
-    const res = await fetch(mode === "login" ? "/api/auth/login" : "/api/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: u, password: p })
-    });
-    const data = await res.json();
-    if (!res.ok) {
+    const r = await safePost(mode === "login" ? "/api/auth/login" : "/api/auth/register", { username: u, password: p });
+    if (!r.ok) {
       statusBox.className = "msg err";
-      statusBox.textContent = data.error || "Ошибка";
+      statusBox.textContent = r.data.error || ("Ошибка сервера HTTP " + r.status);
       return;
     }
-    if (data.role === "USER") {
+    if (r.data.role === "USER") {
       statusBox.className = "msg err";
       statusBox.textContent = "Вы не админ и не модератор. Обратитесь к супер-администратору для выдачи доступа.";
       return;
     }
     statusBox.className = "msg ok";
-    statusBox.textContent = "Доступ подтверждён (" + data.role + "). Перейдите в /admin и войдите с этим аккаунтом.";
+    statusBox.textContent = "Доступ подтверждён (" + r.data.role + "). Перейдите в /admin и войдите с этим аккаунтом.";
     goAdminWrap.style.display = "block";
   } catch (err) {
     statusBox.className = "msg err";
-    statusBox.textContent = "Ошибка сети";
+    statusBox.textContent = "Сервер не отвечает (" + (err.message || "таймаут") + "). Повторите через пару секунд.";
   }
 };
 </script>
@@ -1360,7 +1469,6 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-// Хранение Bearer-токена только в памяти текущей вкладки
 let authToken = "";
 let meData = null;
 let currentTab = "dashboard";
@@ -1400,10 +1508,26 @@ async function apiFetch(url, opts = {}) {
   if (opts.body && !(opts.body instanceof FormData) && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(url, Object.assign({}, opts, { headers }));
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
-  return data;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, Object.assign({}, opts, { headers }));
+      const txt = await res.text();
+      let data = {};
+      try { data = JSON.parse(txt); } catch (_) {}
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt === 0) {
+        await new Promise(r => setTimeout(r, 700));
+        continue;
+      }
+      if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+      return data;
+    } catch (e) {
+      if (attempt === 0 && (e instanceof TypeError)) {
+        await new Promise(r => setTimeout(r, 700));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 function readImageFile(fileInput, maxBytes, onOk, onErr) {
@@ -1453,7 +1577,7 @@ document.getElementById("adminLoginForm").onsubmit = async (e) => {
     renderNav();
     loadActiveTab();
   } catch (err) {
-    errBox.textContent = err.message;
+    errBox.textContent = err.message || "Ошибка подключения к серверу";
     errBox.style.display = "block";
   }
 };
@@ -2028,22 +2152,27 @@ async function renderModerators(root) {
 
 
 # ============================================================
-# HTTP-СЕРВЕР ДЛЯ RENDER (PUBLIC + /admin + REST API)
+# HTTP-СЕРВЕР ДЛЯ RENDER (СТАБИЛЬНЫЙ HTTP/1.0 + ПЕРЕХВАТ ОШИБОК)
 # ============================================================
 class AdminHttpHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    protocol_version = "HTTP/1.0"
 
     def log_message(self, format, *args):
         pass
 
     def _send_bytes(self, code: int, content_type: str, raw: bytes):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_json(self, code: int, obj: dict):
         self._send_bytes(code, "application/json; charset=utf-8", json.dumps(obj, ensure_ascii=False).encode("utf-8"))
@@ -2064,7 +2193,8 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         token = auth_h[7:].strip()
         if not token:
             return None
-        with get_conn() as conn:
+
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -2087,6 +2217,8 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     "token": token,
                 }
 
+        return with_db(_op)
+
     def _require_perm(self, perm: str | None = None) -> dict | None:
         admin = self._get_auth_admin()
         if not admin:
@@ -2101,6 +2233,26 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         return admin
 
     def do_GET(self):
+        try:
+            self._dispatch_get()
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            print(f"[HTTP GET DB ERROR] {exc}", flush=True)
+            self._send_json(503, {"error": "Временная ошибка подключения к БД. Повторите запрос."})
+        except Exception as exc:
+            print(f"[HTTP GET ERROR] {exc}", flush=True)
+            self._send_json(500, {"error": f"Внутренняя ошибка сервера: {exc}"})
+
+    def do_POST(self):
+        try:
+            self._dispatch_post()
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            print(f"[HTTP POST DB ERROR] {exc}", flush=True)
+            self._send_json(503, {"error": "Временная ошибка подключения к БД. Повторите запрос."})
+        except Exception as exc:
+            print(f"[HTTP POST ERROR] {exc}", flush=True)
+            self._send_json(500, {"error": f"Внутренняя ошибка сервера: {exc}"})
+
+    def _dispatch_get(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -2112,7 +2264,7 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
             self._send_bytes(200, "text/html; charset=utf-8", ADMIN_HTML.encode("utf-8"))
             return
         if path == "/health":
-            self._send_json(200, {"ok": True})
+            self._send_json(200, {"ok": True, "db_ready": _db_initialized})
             return
 
         if path == "/api/auth/me":
@@ -2124,16 +2276,14 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/dashboard":
-            if not self._require_perm("view_dashboard"):
-                return
-            self._handle_dashboard()
+            if self._require_perm("view_dashboard"):
+                self._handle_dashboard()
             return
 
         if path == "/api/users":
-            if not self._require_perm("view_users"):
-                return
-            q = (qs.get("q", [""])[0] or "").strip()
-            self._handle_bot_users(q)
+            if self._require_perm("view_users"):
+                q = (qs.get("q", [""])[0] or "").strip()
+                self._handle_bot_users(q)
             return
 
         if path == "/api/gdz-users":
@@ -2146,69 +2296,63 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/api/gdz-users/") and path.endswith("/chats"):
-            if not self._require_perm("view_chats"):
-                return
-            try:
-                gdz_uid = int(path.split("/")[3])
-            except Exception:
-                self._send_json(400, {"error": "Некорректный ID"})
-                return
-            self._handle_gdz_user_chats(gdz_uid)
+            if self._require_perm("view_chats"):
+                try:
+                    gdz_uid = int(path.split("/")[3])
+                except Exception:
+                    self._send_json(400, {"error": "Некорректный ID"})
+                    return
+                self._handle_gdz_user_chats(gdz_uid)
             return
 
         if path.startswith("/api/gdz-users/") and path.endswith("/detail"):
-            if not self._require_perm("view_users"):
-                return
-            try:
-                gdz_uid = int(path.split("/")[3])
-            except Exception:
-                self._send_json(400, {"error": "Некорректный ID"})
-                return
-            self._handle_gdz_user_detail(gdz_uid)
+            if self._require_perm("view_users"):
+                try:
+                    gdz_uid = int(path.split("/")[3])
+                except Exception:
+                    self._send_json(400, {"error": "Некорректный ID"})
+                    return
+                self._handle_gdz_user_detail(gdz_uid)
             return
 
         if path.startswith("/api/users/") and path.endswith("/chats"):
-            if not self._require_perm("view_chats"):
-                return
-            try:
-                tg_id = int(path.split("/")[3])
-            except Exception:
-                self._send_json(400, {"error": "Некорректный ID"})
-                return
-            self._handle_tg_user_chats(tg_id)
+            if self._require_perm("view_chats"):
+                try:
+                    tg_id = int(path.split("/")[3])
+                except Exception:
+                    self._send_json(400, {"error": "Некорректный ID"})
+                    return
+                self._handle_tg_user_chats(tg_id)
             return
 
         if path.startswith("/api/users/"):
-            if not self._require_perm("view_users"):
-                return
-            try:
-                tg_id = int(path.split("/")[3])
-            except Exception:
-                self._send_json(400, {"error": "Некорректный ID"})
-                return
-            self._handle_tg_user_detail(tg_id)
+            if self._require_perm("view_users"):
+                try:
+                    tg_id = int(path.split("/")[3])
+                except Exception:
+                    self._send_json(400, {"error": "Некорректный ID"})
+                    return
+                self._handle_tg_user_detail(tg_id)
             return
 
         if path.startswith("/api/chats/messages/") and path.endswith("/media"):
-            if not self._require_perm("view_chats"):
-                return
-            try:
-                msg_uid = int(path.split("/")[4])
-            except Exception:
-                self._send_json(400, {"error": "Некорректный msg_uid"})
-                return
-            self._handle_chat_message_media(msg_uid)
+            if self._require_perm("view_chats"):
+                try:
+                    msg_uid = int(path.split("/")[4])
+                except Exception:
+                    self._send_json(400, {"error": "Некорректный msg_uid"})
+                    return
+                self._handle_chat_message_media(msg_uid)
             return
 
         if path.startswith("/api/chats/") and path.endswith("/messages"):
-            if not self._require_perm("view_chats"):
-                return
-            try:
-                room_uid = int(path.split("/")[3])
-            except Exception:
-                self._send_json(400, {"error": "Некорректный room_uid"})
-                return
-            self._handle_chat_messages(room_uid)
+            if self._require_perm("view_chats"):
+                try:
+                    room_uid = int(path.split("/")[3])
+                except Exception:
+                    self._send_json(400, {"error": "Некорректный room_uid"})
+                    return
+                self._handle_chat_messages(room_uid)
             return
 
         if path == "/api/moderators":
@@ -2223,7 +2367,7 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
 
         self._send_json(404, {"error": "Not found"})
 
-    def do_POST(self):
+    def _dispatch_post(self):
         path = urlparse(self.path).path
         try:
             body = self._read_json()
@@ -2243,10 +2387,10 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/logout":
             admin = self._get_auth_admin()
             if admin:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("DELETE FROM banka_bot_web_sessions WHERE token = %s;", (admin["token"],))
-                    conn.commit()
+                with_db(lambda conn: (
+                    conn.cursor().execute("DELETE FROM banka_bot_web_sessions WHERE token = %s;", (admin["token"],)),
+                    conn.commit(),
+                ))
             self._send_json(200, {"ok": True})
             return
 
@@ -2288,22 +2432,22 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
     def _handle_register(self, body: dict):
         username = str(body.get("username", "")).strip()
         password = str(body.get("password", ""))
-        if len(username) < 3 or len(username) > 50 or len(password) < 4:
-            self._send_json(400, {"error": "Логин от 3 символов, пароль от 4 символов"})
+        if len(username) < 3 or len(username) > 50 or any(c.isspace() for c in username) or len(password) < 4:
+            self._send_json(400, {"error": "Логин от 3 до 50 символов без пробелов, пароль от 4 символов"})
             return
         pw_hash = hash_password(password)
         all_perm_json = json.dumps([k for k, _ in ALL_PERMISSIONS])
-        with get_conn() as conn:
+
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute("LOCK TABLE banka_bot_web_admins IN EXCLUSIVE MODE;")
-                cur.execute("SELECT COUNT(*) FROM banka_bot_web_admins;")
-                cnt = int(cur.fetchone()[0])
-                role = "SUPER_ADMIN" if cnt == 0 else "USER"
-                perms_json = all_perm_json if cnt == 0 else "[]"
+                cur.execute("SELECT COUNT(*) FROM banka_bot_web_admins WHERE role = 'SUPER_ADMIN';")
+                super_cnt = int(cur.fetchone()[0])
+                role = "SUPER_ADMIN" if super_cnt == 0 else "USER"
+                perms_json = all_perm_json if super_cnt == 0 else "[]"
                 cur.execute("SELECT 1 FROM banka_bot_web_admins WHERE LOWER(username) = LOWER(%s) LIMIT 1;", (username,))
                 if cur.fetchone():
-                    self._send_json(409, {"error": "Такой логин уже занят"})
-                    return
+                    return None, "exists"
                 cur.execute(
                     """
                     INSERT INTO banka_bot_web_admins (username, password_hash, role, permissions_json)
@@ -2314,12 +2458,20 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                 )
                 uid = int(cur.fetchone()[0])
             conn.commit()
+            return (uid, role), None
+
+        res, err = with_db(_op)
+        if err == "exists":
+            self._send_json(409, {"error": "Такой логин уже занят"})
+            return
+        uid, role = res
         self._send_json(200, {"admin_uid": uid, "username": username, "role": role})
 
     def _handle_login(self, body: dict):
         username = str(body.get("username", "")).strip()
         password = str(body.get("password", ""))
-        with get_conn() as conn:
+
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT admin_uid, username, password_hash, role, permissions_json FROM banka_bot_web_admins WHERE LOWER(username) = LOWER(%s) LIMIT 1;",
@@ -2327,12 +2479,10 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                 )
                 row = cur.fetchone()
                 if not row or not verify_password(password, row[2]):
-                    self._send_json(401, {"error": "Неверный логин или пароль"})
-                    return
+                    return None
                 uid, uname, _, role, p_json = row
                 if role == "USER":
-                    self._send_json(200, {"role": "USER", "username": uname})
-                    return
+                    return {"role": "USER", "username": uname}
                 token = secrets.token_urlsafe(48)
                 cur.execute(
                     "INSERT INTO banka_bot_web_sessions (token, admin_uid, expires_at) VALUES (%s, %s, CURRENT_TIMESTAMP + INTERVAL '7 days');",
@@ -2340,16 +2490,19 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                 )
                 cur.execute("UPDATE banka_bot_web_admins SET last_login_at = CURRENT_TIMESTAMP WHERE admin_uid = %s;", (int(uid),))
             conn.commit()
-        self._send_json(
-            200,
-            {
+            return {
                 "token": token,
                 "admin_uid": int(uid),
                 "username": uname,
                 "role": role,
                 "permissions": parse_perms(p_json),
-            },
-        )
+            }
+
+        res = with_db(_op)
+        if not res:
+            self._send_json(401, {"error": "Неверный логин или пароль"})
+            return
+        self._send_json(200, res)
 
     def _handle_dashboard(self):
         msk_now = datetime.now(MSK_TZ)
@@ -2357,7 +2510,7 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         week_start_ms = now_ms() - 7 * 86_400_000
         month_start_ms = now_ms() - 30 * 86_400_000
 
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -2401,24 +2554,20 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     ORDER BY order_uid DESC LIMIT 20;
                     """
                 )
-                recent = []
-                for r in cur.fetchall():
-                    recent.append(
-                        {
-                            "order_uid": int(r[0]),
-                            "buyer_uid": int(r[1]),
-                            "buyer_login": r[2] or "",
-                            "item_label": _format_item_label(r[3], r[4], r[5], r[6]),
-                            "stars_amount": int(r[7]),
-                            "status_tag": r[8],
-                            "telegram_user_id": int(r[9] or 0),
-                            "created_msk": fmt_msk(r[10]),
-                        }
-                    )
-
-        self._send_json(
-            200,
-            {
+                recent = [
+                    {
+                        "order_uid": int(r[0]),
+                        "buyer_uid": int(r[1]),
+                        "buyer_login": r[2] or "",
+                        "item_label": _format_item_label(r[3], r[4], r[5], r[6]),
+                        "stars_amount": int(r[7]),
+                        "status_tag": r[8],
+                        "telegram_user_id": int(r[9] or 0),
+                        "created_msk": fmt_msk(r[10]),
+                    }
+                    for r in cur.fetchall()
+                ]
+            return {
                 "stars_today": int(s[0]),
                 "orders_today": int(s[1]),
                 "stars_week": int(s[2]),
@@ -2434,24 +2583,18 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                 "chat_rooms_count": rooms_cnt,
                 "chat_messages_count": msgs_cnt,
                 "recent_orders": recent,
-            },
-        )
+            }
+
+        self._send_json(200, with_db(_op))
 
     def _handle_bot_users(self, q: str):
         like = f"%{q}%"
-        with get_conn() as conn:
+
+        def _op(conn):
             with conn.cursor() as cur:
                 has_vault = _table_exists(cur, "banka_profiles_vault")
-                join_vault = (
-                    "LEFT JOIN banka_profiles_vault v ON v.rec_uid = b.gdz_user_id"
-                    if has_vault
-                    else ""
-                )
-                vault_cols = (
-                    "COALESCE(NULLIF(TRIM(v.title_first || ' ' || v.title_last), ''), '') AS gdz_fullname"
-                    if has_vault
-                    else "'' AS gdz_fullname"
-                )
+                join_vault = "LEFT JOIN banka_profiles_vault v ON v.rec_uid = b.gdz_user_id" if has_vault else ""
+                vault_cols = "COALESCE(NULLIF(TRIM(v.title_first || ' ' || v.title_last), ''), '') AS gdz_fullname" if has_vault else "'' AS gdz_fullname"
                 where_sql = ""
                 params = []
                 if q:
@@ -2463,7 +2606,6 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                            OR b.gdz_login ILIKE %s
                     """
                     params = [like, like, like, like, like]
-
                 cur.execute(
                     f"""
                     SELECT b.tg_user_id, b.tg_username, b.tg_first_name, b.tg_last_name,
@@ -2479,37 +2621,33 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     """,
                     params,
                 )
-                users = []
-                for r in cur.fetchall():
-                    users.append(
-                        {
-                            "tg_user_id": int(r[0]),
-                            "tg_username": r[1] or "",
-                            "tg_first_name": r[2] or "",
-                            "tg_last_name": r[3] or "",
-                            "gdz_user_id": int(r[4] or 0),
-                            "gdz_login": r[5] or "",
-                            "gdz_fullname": r[6] or "",
-                            "last_seen_msk": fmt_msk(r[7]),
-                            "spent_stars": int(r[8]),
-                            "paid_orders_count": int(r[9]),
-                        }
-                    )
-        self._send_json(200, {"users": users})
+                return [
+                    {
+                        "tg_user_id": int(r[0]),
+                        "tg_username": r[1] or "",
+                        "tg_first_name": r[2] or "",
+                        "tg_last_name": r[3] or "",
+                        "gdz_user_id": int(r[4] or 0),
+                        "gdz_login": r[5] or "",
+                        "gdz_fullname": r[6] or "",
+                        "last_seen_msk": fmt_msk(r[7]),
+                        "spent_stars": int(r[8]),
+                        "paid_orders_count": int(r[9]),
+                    }
+                    for r in cur.fetchall()
+                ]
+
+        self._send_json(200, {"users": with_db(_op)})
 
     def _handle_gdz_users(self, q: str):
         like = f"%{q}%"
-        with get_conn() as conn:
+
+        def _op(conn):
             with conn.cursor() as cur:
                 if not _table_exists(cur, "banka_profiles_vault"):
-                    self._send_json(200, {"users": []})
-                    return
+                    return []
                 has_chats = _table_exists(cur, "banka_chat_members")
-                chats_expr = (
-                    "(SELECT COUNT(*) FROM banka_chat_members cm WHERE cm.member_uid = v.rec_uid)"
-                    if has_chats
-                    else "0"
-                )
+                chats_expr = "(SELECT COUNT(*) FROM banka_chat_members cm WHERE cm.member_uid = v.rec_uid)" if has_chats else "0"
                 where_sql = ""
                 params = [now_ms()]
                 if q:
@@ -2521,7 +2659,6 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                            OR v.cohort_code ILIKE %s
                     """
                     params.extend([like, like, like, like, like])
-
                 cur.execute(
                     f"""
                     SELECT v.rec_uid, v.entry_tag,
@@ -2540,23 +2677,23 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     """,
                     params,
                 )
-                users = []
-                for r in cur.fetchall():
-                    users.append(
-                        {
-                            "rec_uid": int(r[0]),
-                            "login": r[1] or "",
-                            "full_name": (r[2] or "").strip(),
-                            "cohort_code": r[3] or "",
-                            "rank_badge": r[4] or "STUDENT",
-                            "is_vip": bool(r[5]),
-                            "coins": int(r[6]),
-                            "chats_count": int(r[7]),
-                            "spent_stars": int(r[8]),
-                            "tg_user_id": int(r[9] or 0),
-                        }
-                    )
-        self._send_json(200, {"users": users})
+                return [
+                    {
+                        "rec_uid": int(r[0]),
+                        "login": r[1] or "",
+                        "full_name": (r[2] or "").strip(),
+                        "cohort_code": r[3] or "",
+                        "rank_badge": r[4] or "STUDENT",
+                        "is_vip": bool(r[5]),
+                        "coins": int(r[6]),
+                        "chats_count": int(r[7]),
+                        "spent_stars": int(r[8]),
+                        "tg_user_id": int(r[9] or 0),
+                    }
+                    for r in cur.fetchall()
+                ]
+
+        self._send_json(200, {"users": with_db(_op)})
 
     def _fetch_orders_and_dms(self, cur, tg_id: int, gdz_uid: int):
         cur.execute(
@@ -2604,39 +2741,44 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         return orders, msgs
 
     def _handle_tg_user_detail(self, tg_id: int):
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT gdz_user_id FROM banka_bot_users WHERE tg_user_id = %s LIMIT 1;", (tg_id,))
                 row = cur.fetchone()
                 gdz_uid = int(row[0]) if (row and row[0]) else 0
                 orders, msgs = self._fetch_orders_and_dms(cur, tg_id, gdz_uid)
-        self._send_json(200, {"tg_user_id": tg_id, "gdz_user_id": gdz_uid, "orders": orders, "messages": msgs})
+                return {"tg_user_id": tg_id, "gdz_user_id": gdz_uid, "orders": orders, "messages": msgs}
+
+        self._send_json(200, with_db(_op))
 
     def _handle_gdz_user_detail(self, gdz_uid: int):
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT COALESCE(MAX(tg_user_id), 0) FROM banka_bot_users WHERE gdz_user_id = %s;", (gdz_uid,))
                 tg_id = int(cur.fetchone()[0] or 0)
                 orders, msgs = self._fetch_orders_and_dms(cur, tg_id, gdz_uid)
-        self._send_json(200, {"tg_user_id": tg_id, "gdz_user_id": gdz_uid, "orders": orders, "messages": msgs})
+                return {"tg_user_id": tg_id, "gdz_user_id": gdz_uid, "orders": orders, "messages": msgs}
+
+        self._send_json(200, with_db(_op))
 
     def _handle_tg_user_chats(self, tg_id: int):
-        with get_conn() as conn:
+        def _find_gdz(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT gdz_user_id FROM banka_bot_users WHERE tg_user_id = %s LIMIT 1;", (tg_id,))
                 row = cur.fetchone()
-                if not row or not row[0]:
-                    self._send_json(200, {"rooms": []})
-                    return
-                gdz_uid = int(row[0])
+                return int(row[0]) if (row and row[0]) else 0
+
+        gdz_uid = with_db(_find_gdz)
+        if gdz_uid <= 0:
+            self._send_json(200, {"rooms": []})
+            return
         self._handle_gdz_user_chats(gdz_uid)
 
     def _handle_gdz_user_chats(self, gdz_uid: int):
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 if not (_table_exists(cur, "banka_chat_rooms") and _table_exists(cur, "banka_chat_members") and _table_exists(cur, "banka_chat_messages")):
-                    self._send_json(200, {"rooms": []})
-                    return
+                    return []
                 cur.execute(
                     """
                     SELECT
@@ -2675,14 +2817,15 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                             "updated_msk": fmt_msk(r[4]),
                         }
                     )
-        self._send_json(200, {"rooms": rooms})
+                return rooms
+
+        self._send_json(200, {"rooms": with_db(_op)})
 
     def _handle_chat_messages(self, room_uid: int):
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 if not _table_exists(cur, "banka_chat_messages"):
-                    self._send_json(200, {"messages": []})
-                    return
+                    return []
                 cur.execute(
                     """
                     SELECT
@@ -2712,7 +2855,7 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     (room_uid,),
                 )
                 rows = list(reversed(cur.fetchall()))
-                messages = [
+                return [
                     {
                         "msg_uid": int(r[0]),
                         "sender_uid": int(r[1]),
@@ -2734,20 +2877,23 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     }
                     for r in rows
                 ]
-        self._send_json(200, {"messages": messages})
+
+        self._send_json(200, {"messages": with_db(_op)})
 
     def _handle_chat_message_media(self, msg_uid: int):
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 if not _table_exists(cur, "banka_chat_messages"):
-                    self._send_json(404, {"error": "Не найдено"})
-                    return
+                    return None
                 cur.execute("SELECT COALESCE(media_b64, '') FROM banka_chat_messages WHERE msg_uid = %s LIMIT 1;", (msg_uid,))
                 row = cur.fetchone()
-                if not row or not row[0]:
-                    self._send_json(404, {"error": "Фото отсутствует"})
-                    return
-                self._send_json(200, {"media_b64": row[0]})
+                return row[0] if (row and row[0]) else None
+
+        b64 = with_db(_op)
+        if not b64:
+            self._send_json(404, {"error": "Фото отсутствует"})
+            return
+        self._send_json(200, {"media_b64": b64})
 
     def _handle_dm(self, admin: dict, body: dict):
         try:
@@ -2768,19 +2914,19 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         try:
             send_telegram_content(tg_id, text, photo_bytes, photo_name)
         except Exception as e:
-            self._send_json(502, {"error": f"Ошибка отправки в Telegram: {e}"})
+            self._send_json(400, {"error": f"Telegram отклонил отправку: {e}"})
             return
 
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO banka_bot_messages_log (sender_admin, target_type, target_tg_id, message_text, has_photo, sent_count, failed_count)
-                    VALUES (%s, 'DM', %s, %s, %s, 1, 0);
-                    """,
-                    (admin["username"], tg_id, text, bool(photo_bytes)),
-                )
-            conn.commit()
+        with_db(lambda conn: (
+            conn.cursor().execute(
+                """
+                INSERT INTO banka_bot_messages_log (sender_admin, target_type, target_tg_id, message_text, has_photo, sent_count, failed_count)
+                VALUES (%s, 'DM', %s, %s, %s, 1, 0);
+                """,
+                (admin["username"], tg_id, text, bool(photo_bytes)),
+            ),
+            conn.commit(),
+        ))
         self._send_json(200, {"ok": True})
 
     def _handle_broadcast(self, admin: dict, body: dict):
@@ -2796,7 +2942,7 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
             return
 
-        with get_conn() as conn:
+        def _get_targets(conn):
             with conn.cursor() as cur:
                 if audience == "linked":
                     cur.execute("SELECT tg_user_id FROM banka_bot_users WHERE COALESCE(is_blocked, FALSE) = FALSE AND gdz_user_id > 0;")
@@ -2811,8 +2957,9 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     )
                 else:
                     cur.execute("SELECT tg_user_id FROM banka_bot_users WHERE COALESCE(is_blocked, FALSE) = FALSE;")
-                targets = [int(r[0]) for r in cur.fetchall()]
+                return [int(r[0]) for r in cur.fetchall()]
 
+        targets = with_db(_get_targets)
         sent_ok = 0
         failed = 0
         cached_file_id = None
@@ -2829,7 +2976,7 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     blocked_ids.append(tid)
             time.sleep(0.04)
 
-        with get_conn() as conn:
+        def _log_bc(conn):
             with conn.cursor() as cur:
                 if blocked_ids:
                     cur.execute(
@@ -2845,13 +2992,14 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                 )
             conn.commit()
 
+        with_db(_log_bc)
         self._send_json(200, {"ok": True, "sent": sent_ok, "failed": failed, "total": len(targets), "has_photo": bool(photo_bytes)})
 
     def _handle_list_moderators(self):
-        with get_conn() as conn:
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT admin_uid, username, role, permissions_json, created_at FROM banka_bot_web_admins ORDER BY admin_uid ASC;")
-                admins = [
+                return [
                     {
                         "admin_uid": int(r[0]),
                         "username": r[1],
@@ -2861,10 +3009,11 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
                     }
                     for r in cur.fetchall()
                 ]
+
         self._send_json(
             200,
             {
-                "admins": admins,
+                "admins": with_db(_op),
                 "all_permissions": [{"key": k, "label": lbl} for k, lbl in ALL_PERMISSIONS],
             },
         )
@@ -2878,24 +3027,27 @@ class AdminHttpHandler(BaseHTTPRequestHandler):
         if uid == actor["admin_uid"]:
             self._send_json(400, {"error": "Нельзя изменить собственную роль"})
             return
-        with get_conn() as conn:
+
+        def _op(conn):
             with conn.cursor() as cur:
                 cur.execute("UPDATE banka_bot_web_admins SET role = %s WHERE admin_uid = %s AND role <> 'SUPER_ADMIN';", (role, uid))
                 if role == "USER":
                     cur.execute("DELETE FROM banka_bot_web_sessions WHERE admin_uid = %s;", (uid,))
             conn.commit()
+
+        with_db(_op)
         self._send_json(200, {"ok": True})
 
     def _handle_set_mod_perms(self, body: dict):
         uid = int(body.get("admin_uid", 0))
         perms = [str(p) for p in (body.get("permissions") or []) if str(p) in PERM_KEYS]
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE banka_bot_web_admins SET permissions_json = %s WHERE admin_uid = %s AND role = 'MODERATOR';",
-                    (json.dumps(perms), uid),
-                )
-            conn.commit()
+        with_db(lambda conn: (
+            conn.cursor().execute(
+                "UPDATE banka_bot_web_admins SET permissions_json = %s WHERE admin_uid = %s AND role = 'MODERATOR';",
+                (json.dumps(perms), uid),
+            ),
+            conn.commit(),
+        ))
         self._send_json(200, {"ok": True})
 
 
@@ -2918,6 +3070,7 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 def run_bot_polling():
     while True:
         try:
+            ensure_db_ready()
             bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=False)
         except Exception as e:
             print(f"[BOT POLLING ERROR] {e}", flush=True)
@@ -2925,11 +3078,14 @@ def run_bot_polling():
 
 
 def main():
-    init_bot_tables()
-    threading.Thread(target=cancelled_invoice_watcher, daemon=True).start()
-    threading.Thread(target=run_bot_polling, daemon=True).start()
+    # Сначала открываем порт для Render, чтобы не было 502 на старте
     server = ReusableThreadingHTTPServer(("0.0.0.0", PORT), AdminHttpHandler)
     print(f"GDZgo Bot & Admin server listening on 0.0.0.0:{PORT}", flush=True)
+
+    threading.Thread(target=init_db_background, daemon=True).start()
+    threading.Thread(target=cancelled_invoice_watcher, daemon=True).start()
+    threading.Thread(target=run_bot_polling, daemon=True).start()
+
     server.serve_forever()
 
 
